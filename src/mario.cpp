@@ -341,13 +341,39 @@ public:
   boost::asio::serial_port *serial;
   utils::SafeQueue<struct slam::slamPose> &poseQueue;
   const struct tarzan::DiffDriveTwist &drive_cmd;
+  slam::slamHandle *slam_handler;
 
   StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
                boost::asio::serial_port *ser,
                utils::SafeQueue<struct slam::slamPose> &queue,
-               const struct tarzan::DiffDriveTwist &cmd)
+               const struct tarzan::DiffDriveTwist &cmd,
+               slam::slamHandle *sh)
       : nav_ctx(nav), pid_ctx(pid), serial(ser), poseQueue(queue),
-        drive_cmd(cmd) {};
+        drive_cmd(cmd), slam_handler(sh) {};
+
+  bool init() {
+    std::unique_lock<std::mutex> lk(map_sync.mtx);
+    map_sync.cv.wait(lk, [] { return map_sync.flag; });
+    lk.unlock();
+    if (slam::getStatus(slam_handler) != "Tracking") {
+      spdlog::error("FSM init: SLAM not tracking");
+      return false;
+    }
+    if (!serial->is_open()) {
+      spdlog::error("FSM init: serial not open");
+      return false;
+    }
+    spdlog::info("FSM init: all checks passed");
+    return true;
+  }
+
+  void stop() {
+    tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(0.0f, 0.0f);
+    serial::Error err = serial::write_msg<tarzan::tarzan_msg>(
+        serial, msg, tarzan::TARZAN_MSG_LEN);
+    if (err != serial::Error::WriteSuccess)
+      spdlog::error("stop: {}", serial::get_error(err));
+  }
 
   int navGPS(std::queue<std::pair<double, double>> target_gnss) {
     spdlog::info("State Machine : Executing navGPS");
@@ -495,7 +521,8 @@ int main(int argc, char *argv[]) {
 
   StateMachine sm(
       nav_ctx, pid_ctx, serial, poseQueue,
-      tarzan::DiffDriveTwist{vm["linear"].as<float>(), vm["angular"].as<float>()});
+      tarzan::DiffDriveTwist{vm["linear"].as<float>(), vm["angular"].as<float>()},
+      slam_handler);
 
   /* CONFIGURING ZMQ SOCKETS */
   try {

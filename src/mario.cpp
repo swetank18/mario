@@ -245,6 +245,8 @@ void mapping(nav::navContext *nav_ctx,
     std::lock_guard<std::mutex> lock(map_sync.mtx);
     map_sync.flag = true;
     map_sync.cv.notify_all();
+
+    pointcloud_msg.clear();
   }
 }
 

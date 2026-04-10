@@ -44,6 +44,10 @@
 #include "utils.hpp"
 #include "yolo.hpp"
 
+#include <yasmin/state.hpp>
+#include <yasmin/state_machine.hpp>
+#include <yasmin/blackboard/blackboard.hpp>
+
 namespace po = boost::program_options;
 
 #define EARTH_RADIUS 6378137.0
@@ -503,6 +507,152 @@ public:
     spdlog::info("State Machine: navGPS complete");
     return 1;
   }
+};
+
+class InitState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit InitState(StateMachine *sm)
+      : yasmin::State({"PLANNING", "FAULT"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    if (hw->init())
+      return "PLANNING";
+    return "FAULT";
+  }
+
+  std::string to_string() override { return "Init"; }
+};
+
+class PlanningState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit PlanningState(StateMachine *sm)
+      : yasmin::State({"EXECUTING", "GOAL_REACHED", "FAULT"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    PlanResult pr = hw->plan();
+    if (pr == PlanResult::PATH_FOUND)
+      return "EXECUTING";
+    if (pr == PlanResult::AT_GOAL)
+      return "GOAL_REACHED";
+    return "FAULT";
+  }
+
+  std::string to_string() override { return "Planning"; }
+};
+
+class ExecutingState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit ExecutingState(StateMachine *sm)
+      : yasmin::State({"GOAL_REACHED", "PLANNING", "FAULT"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    TraverseResult tr = hw->traverse();
+    switch (tr) {
+    case TraverseResult::REACHED:
+      return "GOAL_REACHED";
+    case TraverseResult::REPLAN_TIMEOUT:
+    case TraverseResult::REPLAN_OBSTACLE:
+      return "PLANNING";
+    case TraverseResult::FAULT_SLAM:
+    case TraverseResult::FAULT_SERIAL:
+      return "FAULT";
+    }
+    return "FAULT";
+  }
+
+  std::string to_string() override { return "Executing"; }
+};
+
+class GoalReachedState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit GoalReachedState(StateMachine *sm)
+      : yasmin::State({"SEARCHING"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    hw->stop();
+    if (!hw->target_gnss.empty())
+      hw->target_gnss.pop();
+    return "SEARCHING";
+  }
+
+  std::string to_string() override { return "GoalReached"; }
+};
+
+class SearchingState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit SearchingState(StateMachine *sm)
+      : yasmin::State({"PLANNING", "MISSION_DONE"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    hw->search();
+    if (!hw->target_gnss.empty())
+      return "PLANNING";
+    return "MISSION_DONE";
+  }
+
+  std::string to_string() override { return "Searching"; }
+};
+
+class MissionDoneState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit MissionDoneState(StateMachine *sm)
+      : yasmin::State({"finish"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    hw->stop();
+    spdlog::info("MISSION COMPLETE");
+    return "finish";
+  }
+
+  std::string to_string() override { return "MissionDone"; }
+};
+
+class FaultState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit FaultState(StateMachine *sm)
+      : yasmin::State({"PLANNING", "ESTOP"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    hw->stop();
+    int count = bb->get<int>("fault_count") + 1;
+    bb->set<int>("fault_count", count);
+    spdlog::warn(std::format("FAULT #{}", count));
+    if (count >= 3)
+      return "ESTOP";
+    return "PLANNING";
+  }
+
+  std::string to_string() override { return "Fault"; }
+};
+
+class EStopState : public yasmin::State {
+public:
+  StateMachine *hw;
+  explicit EStopState(StateMachine *sm)
+      : yasmin::State({"finish"}), hw(sm) {}
+
+  std::string execute(
+      std::shared_ptr<yasmin::blackboard::Blackboard> bb) override {
+    hw->stop();
+    spdlog::error("ESTOP — terminal fault");
+    return "finish";
+  }
+
+  std::string to_string() override { return "EStop"; }
 };
 
 int main(int argc, char *argv[]) {

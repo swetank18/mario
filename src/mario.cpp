@@ -818,7 +818,37 @@ int main(int argc, char *argv[]) {
   }
   spdlog::info(std::format("Loaded {} GNSS waypoints", sm.target_gnss.size()));
 
-  sm.navGPS();
+  /* WIRE FSM */
+  auto fsm = std::make_shared<yasmin::StateMachine>(
+      std::unordered_set<std::string>{"finish"});
+
+  fsm->add_state("INIT", std::make_shared<InitState>(&sm),
+                  {{"PLANNING", "PLANNING"}, {"FAULT", "FAULT"}});
+  fsm->add_state("PLANNING", std::make_shared<PlanningState>(&sm),
+                  {{"EXECUTING", "EXECUTING"},
+                   {"GOAL_REACHED", "GOAL_REACHED"},
+                   {"FAULT", "FAULT"}});
+  fsm->add_state("EXECUTING", std::make_shared<ExecutingState>(&sm),
+                  {{"GOAL_REACHED", "GOAL_REACHED"},
+                   {"PLANNING", "PLANNING"},
+                   {"FAULT", "FAULT"}});
+  fsm->add_state("GOAL_REACHED", std::make_shared<GoalReachedState>(&sm),
+                  {{"SEARCHING", "SEARCHING"}});
+  fsm->add_state("SEARCHING", std::make_shared<SearchingState>(&sm),
+                  {{"PLANNING", "PLANNING"},
+                   {"MISSION_DONE", "MISSION_DONE"}});
+  fsm->add_state("MISSION_DONE", std::make_shared<MissionDoneState>(&sm),
+                  {{"finish", "finish"}});
+  fsm->add_state("FAULT", std::make_shared<FaultState>(&sm),
+                  {{"PLANNING", "PLANNING"}, {"ESTOP", "ESTOP"}});
+  fsm->add_state("ESTOP", std::make_shared<EStopState>(&sm),
+                  {{"finish", "finish"}});
+
+  auto bb = std::make_shared<yasmin::blackboard::Blackboard>();
+  bb->set<int>("fault_count", 0);
+
+  spdlog::info("Starting FSM execution");
+  fsm->execute(bb);
 
   /* CLEANUP */
   capture_thread.join();

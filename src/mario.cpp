@@ -42,6 +42,7 @@
 #include "serial.hpp"
 #include "slam.hpp"
 #include "utils.hpp"
+#include "yolo.hpp"
 
 namespace po = boost::program_options;
 
@@ -370,14 +371,19 @@ public:
   slam::slamHandle *slam_handler;
   ob::PathPtr current_path;
   std::queue<std::pair<double, double>> target_gnss;
+  zmq::socket_t &color_sub;
+  const rerun::RecordingStream &rec;
+  YOLO8Detector *detector;
 
   StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
                boost::asio::serial_port *ser,
                utils::SafeQueue<struct slam::slamPose> &queue,
                const struct tarzan::DiffDriveTwist &cmd,
-               slam::slamHandle *sh)
+               slam::slamHandle *sh, zmq::socket_t &csub,
+               const rerun::RecordingStream &r, YOLO8Detector *det)
       : nav_ctx(nav), pid_ctx(pid), serial(ser), poseQueue(queue),
-        drive_cmd(cmd), slam_handler(sh) {};
+        drive_cmd(cmd), slam_handler(sh), color_sub(csub), rec(r),
+        detector(det) {};
 
   bool init() {
     std::unique_lock<std::mutex> lk(map_sync.mtx);
@@ -401,6 +407,30 @@ public:
         serial, msg, tarzan::TARZAN_MSG_LEN);
     if (err != serial::Error::WriteSuccess)
       spdlog::error("stop: {}", serial::get_error(err));
+  }
+
+  bool search() {
+    std::vector<zmq::message_t> msgs;
+    auto result = zmq::recv_multipart(color_sub, std::back_inserter(msgs));
+    if (!result.has_value() || msgs.size() < 2)
+      return false;
+
+    size_t frame_size = msgs[1].size();
+    cv::Mat frame(480, 640, CV_8UC3, msgs[1].data());
+    if (frame.empty())
+      return false;
+
+    auto detections = detector->detect(frame);
+    if (!detections.empty()) {
+      detector->drawBoundingBox(frame, detections);
+      spdlog::info(std::format("search: {} detections", detections.size()));
+    }
+
+    auto img_data = reinterpret_cast<const uint8_t *>(frame.data);
+    rec.log("search/frame",
+            rerun::Image::from_rgb24({img_data, img_data + frame.total() * 3},
+                                     {640, 480}));
+    return !detections.empty();
   }
 
   PlanResult plan() {
@@ -490,7 +520,9 @@ int main(int argc, char *argv[]) {
       "d", po::value<double>(), "differential gain")(
       "gnss", po::value<std::string>(), "file path of gnss targets")(
       "linear", po::value<float>(), "max linear velocity")(
-      "angular", po::value<float>(), "max angular velocity");
+      "angular", po::value<float>(), "max angular velocity")(
+      "yolo_model", po::value<std::string>(), "path to YOLO ONNX model")(
+      "yolo_labels", po::value<std::string>(), "path to YOLO class labels");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -506,6 +538,7 @@ int main(int argc, char *argv[]) {
   zmq::socket_t pub(ctx, ZMQ_PUB);
   zmq::socket_t slam_sub(ctx, ZMQ_SUB);
   zmq::socket_t mapping_sub(ctx, ZMQ_SUB);
+  zmq::socket_t color_sub(ctx, ZMQ_SUB);
 
   /* realsense vars */
   struct utils::rs_config realsense_config{
@@ -529,6 +562,11 @@ int main(int argc, char *argv[]) {
   struct control::Pid *pid_ctx =
       control::initPid(vm["p"].as<double>(), vm["i"].as<double>(),
                        vm["d"].as<double>());
+
+  /* yolo detector */
+  YOLO8Detector *detector = new YOLO8Detector(
+      vm["yolo_model"].as<std::string>(),
+      vm["yolo_labels"].as<std::string>());
 
   /* CONFIGURING PERIPHERALS */
   spdlog::info("Configuring Rover Peripherals...");
@@ -559,7 +597,7 @@ int main(int argc, char *argv[]) {
   StateMachine sm(
       nav_ctx, pid_ctx, serial, poseQueue,
       tarzan::DiffDriveTwist{vm["linear"].as<float>(), vm["angular"].as<float>()},
-      slam_handler);
+      slam_handler, color_sub, rec, detector);
 
   /* CONFIGURING ZMQ SOCKETS */
   try {
@@ -581,6 +619,13 @@ int main(int argc, char *argv[]) {
   try {
     mapping_sub.connect("inproc://realsense");
     mapping_sub.set(zmq::sockopt::subscribe, topic_pointcloud);
+  } catch (zmq::error_t &e) {
+    spdlog::error(e.what());
+  }
+
+  try {
+    color_sub.connect("inproc://realsense");
+    color_sub.set(zmq::sockopt::subscribe, topic_color);
   } catch (zmq::error_t &e) {
     spdlog::error(e.what());
   }
@@ -633,6 +678,7 @@ int main(int argc, char *argv[]) {
   delete slam_handler;
   delete nav_ctx;
   delete pid_ctx;
+  delete detector;
   utils::destroyHandle(rs_ptr);
   serial::close(serial);
 

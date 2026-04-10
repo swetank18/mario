@@ -250,6 +250,8 @@ enum class TraverseResult {
   FAULT_SERIAL
 };
 
+enum class PlanResult { PATH_FOUND, AT_GOAL, FAULT };
+
 class StateMachine {
 private:
   std::tuple<float, float> get_local_goal(struct tarzan::geodetic &current_gps,
@@ -281,9 +283,9 @@ private:
     return std::make_tuple(local_goal_x, local_goal_y);
   }
 
-  TraverseResult traverse(ob::PathPtr path) {
+  TraverseResult traverse() {
     auto geo_path =
-        std::dynamic_pointer_cast<ompl::geometric::PathGeometric>(path);
+        std::dynamic_pointer_cast<ompl::geometric::PathGeometric>(current_path);
     if (!geo_path || geo_path->getStateCount() == 0) {
       spdlog::warn("State Machine: Path is empty or invalid");
       return TraverseResult::REACHED;
@@ -366,6 +368,8 @@ public:
   utils::SafeQueue<struct slam::slamPose> &poseQueue;
   const struct tarzan::DiffDriveTwist &drive_cmd;
   slam::slamHandle *slam_handler;
+  ob::PathPtr current_path;
+  std::queue<std::pair<double, double>> target_gnss;
 
   StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
                boost::asio::serial_port *ser,
@@ -399,66 +403,75 @@ public:
       spdlog::error("stop: {}", serial::get_error(err));
   }
 
-  int navGPS(std::queue<std::pair<double, double>> target_gnss) {
-    spdlog::info("State Machine : Executing navGPS");
-
-    /* wait for map generation */
-    std::unique_lock<std::mutex> lock(map_sync.mtx);
-    map_sync.cv.wait(lock, [] { return map_sync.flag; });
-    lock.unlock();
-
-    // get current pose
+  PlanResult plan() {
     slam::slamPose pose;
     if (!poseQueue.consume(pose)) {
-      spdlog::error("State Machine : Unable to fetch data from Pose Queue");
-      return 0;
+      spdlog::error("plan: unable to fetch pose");
+      return PlanResult::FAULT;
     }
 
-    // get current gps coordinates
     struct tarzan::geodetic_msg geo_msg;
     serial::Error err = serial::read_msg<struct tarzan::geodetic_msg>(
         serial, &geo_msg, tarzan::GEODETIC_MSG_LEN);
     if (err == serial::AsioReadError || err == serial::CobsDecodeError) {
       spdlog::error(serial::get_error(err));
-      return 0;
+      return PlanResult::FAULT;
     }
+
+    if (target_gnss.empty())
+      return PlanResult::AT_GOAL;
 
     double target_latitude = target_gnss.front().first;
     double target_longitude = target_gnss.front().second;
+
     double dLat = DEG2RAD(target_latitude - geo_msg.geo_data.lat);
     double dLon = DEG2RAD(target_longitude - geo_msg.geo_data.lon);
-    target_gnss.pop();
-
     double x_east =
         dLon * std::cos(DEG2RAD(geo_msg.geo_data.lat)) * EARTH_RADIUS;
     double y_north = dLat * EARTH_RADIUS;
-
     double total_distance = std::sqrt((x_east * x_east) + (y_north * y_north));
 
-    if (total_distance < 2.0) {
-      spdlog::info("State Machine: within 2m of target, done");
-      return 1;
-    }
+    if (total_distance < 2.0)
+      return PlanResult::AT_GOAL;
 
-    std::tuple goal_coords = get_local_goal(geo_msg.geo_data, target_latitude,
-                                            target_longitude, pose);
+    auto [local_x, local_y] = get_local_goal(geo_msg.geo_data, target_latitude,
+                                              target_longitude, pose);
 
     ob::ScopedState<> start(nav_ctx->space);
     start->as<ob::RealVectorStateSpace::StateType>()->values[0] = pose.x;
     start->as<ob::RealVectorStateSpace::StateType>()->values[1] = pose.y;
 
     ob::ScopedState<> goal(nav_ctx->space);
-    goal->as<ob::RealVectorStateSpace::StateType>()->values[0] =
-        get<0>(goal_coords);
-    goal->as<ob::RealVectorStateSpace::StateType>()->values[1] =
-        get<1>(goal_coords);
+    goal->as<ob::RealVectorStateSpace::StateType>()->values[0] = local_x;
+    goal->as<ob::RealVectorStateSpace::StateType>()->values[1] = local_y;
 
-    ob::PathPtr path = nav::get_path(nav_ctx, start, goal);
+    current_path = nav::get_path(nav_ctx, start, goal);
+    if (!current_path) {
+      spdlog::error("plan: planner failed");
+      return PlanResult::FAULT;
+    }
+    return PlanResult::PATH_FOUND;
+  }
 
-    traverse(path);
+  int navGPS() {
+    spdlog::info("State Machine : Executing navGPS");
 
+    std::unique_lock<std::mutex> lock(map_sync.mtx);
+    map_sync.cv.wait(lock, [] { return map_sync.flag; });
+    lock.unlock();
+
+    while (!target_gnss.empty()) {
+      PlanResult pr = plan();
+      if (pr == PlanResult::AT_GOAL) {
+        target_gnss.pop();
+        continue;
+      }
+      if (pr == PlanResult::FAULT)
+        return 0;
+      traverse();
+    }
     spdlog::info("State Machine: navGPS complete");
-    return 0;
+    return 1;
   }
 };
 
@@ -585,7 +598,6 @@ int main(int argc, char *argv[]) {
                              realsense_config);
 
   /* PARSE GNSS WAYPOINTS */
-  std::queue<std::pair<double, double>> target_gnss;
   {
     std::ifstream gnss_file(vm["gnss"].as<std::string>());
     if (!gnss_file.is_open()) {
@@ -601,7 +613,7 @@ int main(int argc, char *argv[]) {
         try {
           double lat = std::stod(lat_str);
           double lon = std::stod(lon_str);
-          target_gnss.push({lat, lon});
+          sm.target_gnss.push({lat, lon});
         } catch (const std::exception &e) {
           spdlog::warn(std::format("Skipping malformed GNSS line: {}", line));
         }
@@ -609,9 +621,9 @@ int main(int argc, char *argv[]) {
     }
     gnss_file.close();
   }
-  spdlog::info(std::format("Loaded {} GNSS waypoints", target_gnss.size()));
+  spdlog::info(std::format("Loaded {} GNSS waypoints", sm.target_gnss.size()));
 
-  sm.navGPS(target_gnss);
+  sm.navGPS();
 
   /* CLEANUP */
   capture_thread.join();

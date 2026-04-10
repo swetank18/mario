@@ -34,6 +34,7 @@
 #include <sys/types.h>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 
@@ -204,7 +205,7 @@ void mapping(nav::navContext *nav_ctx,
       new pcl::PointCloud<pcl::PointXYZ>());
   Eigen::Affine3d T_pc;
 
-  while (!map_sync.flag) {
+  while (true) {
 
     result_pointcloud =
         zmq::recv_multipart(sub, std::back_inserter(pointcloud_msg));
@@ -288,6 +289,7 @@ private:
     return std::make_tuple(local_goal_x, local_goal_y);
   }
 
+public:
   TraverseResult traverse() {
     auto geo_path =
         std::dynamic_pointer_cast<ompl::geometric::PathGeometric>(current_path);
@@ -419,7 +421,6 @@ public:
     if (!result.has_value() || msgs.size() < 2)
       return false;
 
-    size_t frame_size = msgs[1].size();
     cv::Mat frame(480, 640, CV_8UC3, msgs[1].data());
     if (frame.empty())
       return false;

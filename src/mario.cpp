@@ -242,7 +242,14 @@ void mapping(nav::navContext *nav_ctx,
   }
 }
 
-/* state to navigate to gps coordinate */
+enum class TraverseResult {
+  REACHED,
+  REPLAN_TIMEOUT,
+  REPLAN_OBSTACLE,
+  FAULT_SLAM,
+  FAULT_SERIAL
+};
+
 class StateMachine {
 private:
   std::tuple<float, float> get_local_goal(struct tarzan::geodetic &current_gps,
@@ -274,14 +281,16 @@ private:
     return std::make_tuple(local_goal_x, local_goal_y);
   }
 
-  void traverse_path(ob::PathPtr path) {
+  TraverseResult traverse(ob::PathPtr path) {
     auto geo_path =
         std::dynamic_pointer_cast<ompl::geometric::PathGeometric>(path);
     if (!geo_path || geo_path->getStateCount() == 0) {
       spdlog::warn("State Machine: Path is empty or invalid");
-      return;
+      return TraverseResult::REACHED;
     }
     const auto states = geo_path->getStates();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
     uint64_t previous = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
@@ -290,10 +299,27 @@ private:
     double linear_x = drive_cmd.linear_x, angular_z = drive_cmd.angular_z;
 
     while (state_idx < (int)states.size()) {
+      if (std::chrono::steady_clock::now() > deadline)
+        return TraverseResult::REPLAN_TIMEOUT;
+
+      if (slam::getStatus(slam_handler) != "Tracking")
+        return TraverseResult::FAULT_SLAM;
+
       slam::slamPose pose;
       if (!poseQueue.consume(pose)) {
         spdlog::error("State Machine : Unable to fetch data from Pose Queue");
         continue;
+      }
+
+      grid_map::Position gm_pos(pose.x, pose.y);
+      grid_map::Index gm_idx;
+      if (nav_ctx->map->getIndex(gm_pos, gm_idx)) {
+        for (auto &obs : nav_ctx->occupancy_list) {
+          double d = std::sqrt(std::pow(gm_idx(0) - obs(0), 2) +
+                               std::pow(gm_idx(1) - obs(1), 2));
+          if (d < 3.0)
+            return TraverseResult::REPLAN_OBSTACLE;
+        }
       }
 
       auto state = states[state_idx]->as<ob::RealVectorStateSpace::StateType>();
@@ -328,11 +354,9 @@ private:
       serial::Error err = serial::write_msg<struct tarzan::tarzan_msg>(
           serial, msg, tarzan::TARZAN_MSG_LEN);
       if (err != serial::Error::WriteSuccess)
-        spdlog::error(std::format("State Machine: serial write failed: {}",
-                                  serial::get_error(err)));
-      else
-        spdlog::debug("State Machine: drive cmd sent");
+        return TraverseResult::FAULT_SERIAL;
     }
+    return TraverseResult::REACHED;
   }
 
 public:
@@ -431,7 +455,7 @@ public:
 
     ob::PathPtr path = nav::get_path(nav_ctx, start, goal);
 
-    traverse_path(path);
+    traverse(path);
 
     spdlog::info("State Machine: navGPS complete");
     return 0;

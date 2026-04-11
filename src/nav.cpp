@@ -1,4 +1,5 @@
 #include <cmath>
+#include <limits>
 #include <grid_map_core/TypeDefs.hpp>
 #include <grid_map_core/iterators/GridMapIterator.hpp>
 #include <memory>
@@ -125,12 +126,8 @@ void preProcessPointCloud(navContext *ctx,
                           pcl::PointCloud<pcl::PointXYZ>::Ptr rawInputCloud,
                           const Eigen::Matrix<double, 4, 4> T_matrix) {
 
-  // transform pcl cloud
-  pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(
-      new pcl::PointCloud<pcl::PointXYZ>());
-  pcl::transformPointCloud(*rawInputCloud, *transformed_cloud, T_matrix);
+  pcl::transformPointCloud(*rawInputCloud, *rawInputCloud, T_matrix);
 
-  // filtering
   if (rawInputCloud->size() < ctx->params.min_filtering_points) {
     spdlog::info(
         std::format("Skipping filters: Pointcloud size ({}) is below minimum "
@@ -164,6 +161,8 @@ void preProcessPointCloud(navContext *ctx,
 
 void processGridMapCells(navContext *ctx,
                          pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud) {
+
+  ctx->occupancy_list.clear();
 
   if (pointCloud->points.size() < ctx->params.min_grid_points) {
     spdlog::error(std::format("Unable to create elevation Layer: Pointcloud "
@@ -212,9 +211,11 @@ double ValidityChecker::clearance(const ob::State *state) const {
   grid_map::Index index;
   nav_ctx->map->getIndex(position, index);
 
-  // get the closest obstacle
+  if (nav_ctx->occupancy_list.empty())
+    return std::numeric_limits<double>::max();
+
   grid_map::Index &closest_idx = index;
-  double min_dist;
+  double min_dist = std::numeric_limits<double>::max();
   for (auto &i : nav_ctx->occupancy_list) {
     double dist = sqrt(pow((index(0) - i(0)), 2) + pow((index(1) - i(1)), 2));
     if (dist < min_dist) {
@@ -245,14 +246,14 @@ void log_gridmap(navContext *ctx, const rerun::RecordingStream &rec) {
         elevation > ctx->params.occupancy_threshold[1]) {
       free_position.push_back(
           rerun::Position3D(current_index(0), current_index(1), 0));
-      rerun::components::Color color(0, 255, 0); // green - free
+      rerun::components::Color color(0, 255, 0);
       rec.log(
           "GridMap",
           rerun::Points3D(free_position).with_radii(radii).with_colors(color));
     } else {
       occupied_position.push_back(
           rerun::Position3D(current_index(0), current_index(1), 0));
-      rerun::components::Color color(255, 0, 0); // red - obstacle
+      rerun::components::Color color(255, 0, 0);
       rec.log("GridMap", rerun::Points3D(occupied_position)
                              .with_radii(radii)
                              .with_colors(color));
@@ -260,7 +261,8 @@ void log_gridmap(navContext *ctx, const rerun::RecordingStream &rec) {
   }
 }
 
-ob::PathPtr get_path(nav::navContext *ctx, ob::ScopedState<>& start, ob::ScopedState<>& goal) {
+ob::PathPtr get_path(nav::navContext *ctx, ob::ScopedState<>& start,
+                     ob::ScopedState<>& goal) {
 
   // set start and goal states in problem definition
   ctx->pdef->setStartAndGoalStates(start, goal);

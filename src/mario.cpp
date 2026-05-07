@@ -24,6 +24,7 @@
 #include <pcl/common/transforms.h>
 #include <pcl/impl/point_types.hpp>
 #include <pcl/pcl_macros.h>
+#include <queue>
 #include <rerun.hpp>
 #include <rerun/archetypes/image.hpp>
 #include <rerun/archetypes/text_log.hpp>
@@ -33,6 +34,7 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
+#include <taskflow/taskflow.hpp>
 #include <thread>
 #include <tuple>
 #include <unordered_set>
@@ -63,7 +65,8 @@ struct mapReadySignal {
 } map_sync;
 
 /* function to capture & publish realsense frames */
-void capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub) {
+auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
+    -> void {
 
   rs2::frame frame;
 
@@ -133,10 +136,10 @@ void capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub) {
 }
 
 /* function to get slam pose */
-void localize(struct slam::slamHandle *slam_handler,
+auto localize(struct slam::slamHandle *slam_handler,
               utils::SafeQueue<struct slam::slamPose> &poseQueue,
               zmq::socket_t &sub, const rerun::RecordingStream &rec,
-              utils::rs_config realsense_config) {
+              utils::rs_config realsense_config) -> void {
 
   Eigen::Matrix<double, 4, 4> current_pose;
   Eigen::Matrix<double, 4, 4> res;
@@ -189,10 +192,10 @@ void localize(struct slam::slamHandle *slam_handler,
 }
 
 /* function to create gridmap  */
-void mapping(nav::navContext *nav_ctx,
+auto mapping(nav::navContext *nav_ctx,
              utils::SafeQueue<struct slam::slamPose> &poseQueue,
              zmq::socket_t &sub, const rerun::RecordingStream &rec,
-             utils::rs_config realsense_config) {
+             utils::rs_config realsense_config) -> void {
 
   struct slam::slamPose pose;
   std::vector<zmq::message_t> pointcloud_msg;
@@ -247,31 +250,6 @@ void mapping(nav::navContext *nav_ctx,
   }
 }
 
-enum class TraverseResult {
-  REACHED,
-  REPLAN_TIMEOUT,
-  REPLAN_OBSTACLE,
-  FAULT_SLAM,
-  FAULT_SERIAL
-};
-
-enum class PlanResult { PATH_FOUND, AT_GOAL, FAULT };
-
-enum class SearchResult { DETECTED, NOT_FOUND, TIMEOUT };
-
-enum class ApproachResult { ARRIVED, LOST_TARGET, FAULT_SERIAL };
-
-enum class WaypointType { GPS_ONLY, GPS_ARUCO, GPS_OBJECT };
-
-enum class LedColor { RED, BLUE, GREEN };
-
-struct Waypoint {
-  double lat = 0.0;
-  double lon = 0.0;
-  WaypointType type = WaypointType::GPS_ONLY;
-  int aruco_id = -1;
-};
-
 class StateMachine {
 public:
   enum class State {
@@ -286,16 +264,37 @@ public:
     RECOVER_SLAM,
     RECOVER_OBSTACLE,
     FAULT_SERIAL,
-    ESTOP,
     MISSION_DONE,
     MISSION_ABORT
   };
 
+  enum class TraverseResult {
+    REACHED,
+    REPLAN_TIMEOUT,
+    REPLAN_OBSTACLE,
+    FAULT_SLAM,
+    FAULT_SERIAL
+  };
+
+  enum class PlanResult { PATH_FOUND, AT_GOAL, FAULT };
+
+  enum class ApproachResult { ARRIVED, LOST_TARGET, FAULT_SERIAL };
+
+  enum class WaypointType { GPS_ONLY, GPS_ARUCO, GPS_OBJECT };
+
+  enum class LedColor { RED, BLUE, GREEN };
+
+  struct Waypoint {
+    double lat = 0.0;
+    double lon = 0.0;
+    WaypointType type = WaypointType::GPS_ONLY;
+    int aruco_id = -1;
+  };
+
 private:
-  std::tuple<float, float> get_local_goal(struct tarzan::geodetic &current_gps,
-                                          double target_latitude,
-                                          double target_longitude,
-                                          slam::slamPose &pose) {
+  auto get_local_goal(struct tarzan::geodetic &current_gps,
+                      double target_latitude, double target_longitude,
+                      slam::slamPose &pose) -> std::tuple<float, float> {
     double dLat = DEG2RAD(target_latitude - current_gps.lat);
     double dLon = DEG2RAD(target_longitude - current_gps.lon);
 
@@ -321,7 +320,7 @@ private:
     return std::make_tuple(local_goal_x, local_goal_y);
   }
 
-  static const char *state_name(State s) {
+  static auto state_name(State s) -> const char * {
     switch (s) {
     case State::BOOT: return "BOOT";
     case State::WAIT_MAP_READY: return "WAIT_MAP_READY";
@@ -334,57 +333,34 @@ private:
     case State::RECOVER_SLAM: return "RECOVER_SLAM";
     case State::RECOVER_OBSTACLE: return "RECOVER_OBSTACLE";
     case State::FAULT_SERIAL: return "FAULT_SERIAL";
-    case State::ESTOP: return "ESTOP";
     case State::MISSION_DONE: return "MISSION_DONE";
     case State::MISSION_ABORT: return "MISSION_ABORT";
     }
     return "?";
   }
 
-public:
-  struct nav::navContext *nav_ctx;
-  struct control::Pid *pid_ctx;
-  boost::asio::serial_port *serial;
-  utils::SafeQueue<struct slam::slamPose> &poseQueue;
-  tarzan::DiffDriveTwist drive_cmd;
-  slam::slamHandle *slam_handler;
-  ob::PathPtr current_path;
-  std::queue<Waypoint> waypoints;
-  zmq::socket_t &color_sub;
-  const rerun::RecordingStream &rec;
-  YOLO8Detector *detector;
+  auto log_transition(State from, State to) -> void {
+    if (from != to)
+      spdlog::info(
+          std::format("State: {} -> {}", state_name(from), state_name(to)));
+    current_state = to;
+  }
 
-  State current_state = State::BOOT;
-  Waypoint current_waypoint{};
-  std::chrono::steady_clock::time_point search_started_at{};
-  bool search_active = false;
-  int serial_retry_count = 0;
-
-  StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
-               boost::asio::serial_port *ser,
-               utils::SafeQueue<struct slam::slamPose> &queue,
-               tarzan::DiffDriveTwist cmd,
-               slam::slamHandle *sh, zmq::socket_t &csub,
-               const rerun::RecordingStream &r, YOLO8Detector *det)
-      : nav_ctx(nav), pid_ctx(pid), serial(ser), poseQueue(queue),
-        drive_cmd(cmd), slam_handler(sh), color_sub(csub), rec(r),
-        detector(det) {};
-
-  void stop_motors() {
+  auto stop_motors() -> void {
     tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(0.0, 0.0);
     serial::write_msg<struct tarzan::tarzan_msg>(serial, msg,
                                                  tarzan::TARZAN_MSG_LEN);
   }
 
   /* LED protocol on Nucleo TBD — log only for now */
-  void signal_led(LedColor color) {
+  auto signal_led(LedColor color) -> void {
     const char *name = color == LedColor::RED     ? "RED"
                        : color == LedColor::GREEN ? "GREEN"
                                                   : "BLUE";
     spdlog::info(std::format("LED: {}", name));
   }
 
-  TraverseResult traverse() {
+  auto traverse() -> TraverseResult {
     auto geo_path =
         std::dynamic_pointer_cast<ompl::geometric::PathGeometric>(current_path);
     if (!geo_path || geo_path->getStateCount() == 0) {
@@ -462,7 +438,7 @@ public:
     return TraverseResult::REACHED;
   }
 
-  bool search_object() {
+  auto search_object() -> bool {
     std::vector<zmq::message_t> msgs;
     auto result = zmq::recv_multipart(color_sub, std::back_inserter(msgs));
     if (!result.has_value() || msgs.size() < 2)
@@ -485,7 +461,7 @@ public:
     return !detections.empty();
   }
 
-  bool search_aruco() {
+  auto search_aruco() -> bool {
     std::vector<zmq::message_t> msgs;
     auto result = zmq::recv_multipart(color_sub, std::back_inserter(msgs));
     if (!result.has_value() || msgs.size() < 2)
@@ -520,7 +496,7 @@ public:
     return false;
   }
 
-  ApproachResult approach() {
+  auto approach() -> ApproachResult {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     int lost_frames = 0;
     uint64_t previous = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -601,7 +577,7 @@ public:
     return ApproachResult::LOST_TARGET;
   }
 
-  PlanResult plan() {
+  auto plan() -> PlanResult {
     slam::slamPose pose;
     if (!poseQueue.consume(pose)) {
       spdlog::error("plan: unable to fetch pose");
@@ -630,7 +606,7 @@ public:
       return PlanResult::AT_GOAL;
 
     auto [local_x, local_y] = get_local_goal(geo_msg.geo_data, target_latitude,
-                                              target_longitude, pose);
+                                             target_longitude, pose);
 
     ob::ScopedState<> start(nav_ctx->space);
     start->as<ob::RealVectorStateSpace::StateType>()->values[0] = pose.x;
@@ -648,178 +624,269 @@ public:
     return PlanResult::PATH_FOUND;
   }
 
-  State tick() {
-    switch (current_state) {
-    case State::BOOT:
-      return State::WAIT_MAP_READY;
+public:
+  struct nav::navContext *nav_ctx;
+  struct control::Pid *pid_ctx;
+  boost::asio::serial_port *serial;
+  utils::SafeQueue<struct slam::slamPose> &poseQueue;
+  tarzan::DiffDriveTwist drive_cmd;
+  slam::slamHandle *slam_handler;
+  ob::PathPtr current_path;
+  std::queue<Waypoint> waypoints;
+  zmq::socket_t &color_sub;
+  const rerun::RecordingStream &rec;
+  YOLO8Detector *detector;
 
-    case State::WAIT_MAP_READY: {
-      std::unique_lock<std::mutex> lock(map_sync.mtx);
-      map_sync.cv.wait(lock, [] { return map_sync.flag; });
-      return State::LOAD_WAYPOINT;
-    }
+  State current_state = State::BOOT;
+  Waypoint current_waypoint{};
+  std::chrono::steady_clock::time_point search_started_at{};
+  bool search_active = false;
+  int serial_retry_count = 0;
 
-    case State::LOAD_WAYPOINT:
-      if (waypoints.empty())
-        return State::MISSION_DONE;
-      current_waypoint = waypoints.front();
-      waypoints.pop();
-      spdlog::info(std::format("Waypoint: lat={} lon={} type={}",
-                               current_waypoint.lat, current_waypoint.lon,
-                               (int)current_waypoint.type));
-      return State::PLAN_PATH;
+  StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
+               boost::asio::serial_port *ser,
+               utils::SafeQueue<struct slam::slamPose> &queue,
+               tarzan::DiffDriveTwist cmd, slam::slamHandle *sh,
+               zmq::socket_t &csub, const rerun::RecordingStream &r,
+               YOLO8Detector *det)
+      : nav_ctx(nav), pid_ctx(pid), serial(ser), poseQueue(queue),
+        drive_cmd(cmd), slam_handler(sh), color_sub(csub), rec(r),
+        detector(det) {};
 
-    case State::PLAN_PATH: {
-      PlanResult pr = plan();
-      if (pr == PlanResult::PATH_FOUND) {
-        serial_retry_count = 0;
-        return State::TRAVERSE_PATH;
-      }
-      if (pr == PlanResult::FAULT)
-        return State::FAULT_SERIAL;
-      if (current_waypoint.type == WaypointType::GPS_ONLY)
-        return State::WAYPOINT_REACHED;
-      return State::SEARCH_TARGET;
-    }
+  auto run() -> int {
+    tf::Executor executor(1);
+    tf::Taskflow taskflow;
 
-    case State::TRAVERSE_PATH: {
-      TraverseResult tr = traverse();
-      switch (tr) {
-      case TraverseResult::REACHED:
-      case TraverseResult::REPLAN_TIMEOUT:
-        return State::PLAN_PATH;
-      case TraverseResult::REPLAN_OBSTACLE:
-        return State::RECOVER_OBSTACLE;
-      case TraverseResult::FAULT_SLAM:
-        return State::RECOVER_SLAM;
-      case TraverseResult::FAULT_SERIAL:
-        return State::FAULT_SERIAL;
-      }
-      return State::PLAN_PATH;
-    }
-
-    case State::SEARCH_TARGET: {
-      if (!search_active) {
-        search_started_at = std::chrono::steady_clock::now();
-        search_active = true;
-      }
-      if (std::chrono::steady_clock::now() - search_started_at >
-          std::chrono::seconds(60)) {
-        search_active = false;
-        spdlog::warn("Search: timeout, claiming partial credit");
-        return State::WAYPOINT_REACHED;
-      }
-
-      bool found = current_waypoint.type == WaypointType::GPS_ARUCO
-                       ? search_aruco()
-                       : search_object();
-      if (found) {
-        search_active = false;
-        return State::APPROACH_TARGET;
-      }
-
-      tarzan::tarzan_msg msg =
-          tarzan::get_tarzan_msg(0.0, drive_cmd.angular_z * 0.3);
-      serial::Error err = serial::write_msg<struct tarzan::tarzan_msg>(
-          serial, msg, tarzan::TARZAN_MSG_LEN);
-      if (err != serial::Error::WriteSuccess)
-        return State::FAULT_SERIAL;
-      return State::SEARCH_TARGET;
-    }
-
-    case State::APPROACH_TARGET: {
-      ApproachResult ar = approach();
-      if (ar == ApproachResult::ARRIVED)
-        return State::WAYPOINT_REACHED;
-      if (ar == ApproachResult::LOST_TARGET)
-        return State::SEARCH_TARGET;
-      return State::FAULT_SERIAL;
-    }
-
-    case State::WAYPOINT_REACHED:
-      stop_motors();
-      signal_led(LedColor::GREEN);
-      std::this_thread::sleep_for(std::chrono::seconds(2));
-      return State::LOAD_WAYPOINT;
-
-    case State::RECOVER_SLAM: {
-      stop_motors();
-      auto deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds(10);
-      while (std::chrono::steady_clock::now() < deadline) {
-        if (slam::getStatus(slam_handler) == "Tracking")
-          return State::PLAN_PATH;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      }
-      return State::MISSION_ABORT;
-    }
-
-    case State::RECOVER_OBSTACLE:
-      stop_motors();
-      current_path.reset();
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      return State::PLAN_PATH;
-
-    case State::FAULT_SERIAL:
-      stop_motors();
-      if (++serial_retry_count > 5)
-        return State::MISSION_ABORT;
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-      return State::PLAN_PATH;
-
-    case State::ESTOP:
-      stop_motors();
-      return State::ESTOP;
-
-    case State::MISSION_DONE:
-    case State::MISSION_ABORT:
-      return current_state;
-    }
-    return current_state;
-  }
-
-  int navGPS() {
-    spdlog::info("State Machine : Executing navGPS");
     signal_led(LedColor::RED);
+    current_state = State::BOOT;
 
-    while (current_state != State::MISSION_DONE &&
-           current_state != State::MISSION_ABORT) {
-      State next = tick();
-      if (next != current_state)
-        spdlog::info(std::format("State: {} -> {}", state_name(current_state),
-                                 state_name(next)));
-      current_state = next;
-    }
+    auto t_boot = taskflow.emplace([this]() -> int {
+                            log_transition(current_state, State::WAIT_MAP_READY);
+                            return 0;
+                          })
+                      .name("BOOT");
 
-    if (current_state == State::MISSION_DONE) {
-      signal_led(LedColor::GREEN);
-      spdlog::info("State Machine: navGPS complete");
-      return 1;
-    }
-    spdlog::error(
-        std::format("State Machine: aborted in {}", state_name(current_state)));
-    return 0;
-  }
+    auto t_wait_map = taskflow.emplace([this]() -> int {
+                                std::unique_lock<std::mutex> lock(map_sync.mtx);
+                                map_sync.cv.wait(
+                                    lock, [] { return map_sync.flag; });
+                                log_transition(current_state,
+                                               State::LOAD_WAYPOINT);
+                                return 0;
+                              })
+                          .name("WAIT_MAP_READY");
 
-  int navGPS() {
-    spdlog::info("State Machine : Executing navGPS");
+    auto t_load_wp = taskflow.emplace([this]() -> int {
+                               if (waypoints.empty()) {
+                                 log_transition(current_state,
+                                                State::MISSION_DONE);
+                                 return 0;
+                               }
+                               current_waypoint = waypoints.front();
+                               waypoints.pop();
+                               spdlog::info(std::format(
+                                   "Waypoint: lat={} lon={} type={}",
+                                   current_waypoint.lat, current_waypoint.lon,
+                                   (int)current_waypoint.type));
+                               log_transition(current_state, State::PLAN_PATH);
+                               return 1;
+                             })
+                         .name("LOAD_WAYPOINT");
 
-    std::unique_lock<std::mutex> lock(map_sync.mtx);
-    map_sync.cv.wait(lock, [] { return map_sync.flag; });
-    lock.unlock();
+    auto t_plan_path = taskflow.emplace([this]() -> int {
+                                 PlanResult pr = plan();
+                                 if (pr == PlanResult::PATH_FOUND) {
+                                   serial_retry_count = 0;
+                                   log_transition(current_state,
+                                                  State::TRAVERSE_PATH);
+                                   return 0;
+                                 }
+                                 if (pr == PlanResult::FAULT) {
+                                   log_transition(current_state,
+                                                  State::FAULT_SERIAL);
+                                   return 3;
+                                 }
+                                 if (current_waypoint.type ==
+                                     WaypointType::GPS_ONLY) {
+                                   log_transition(current_state,
+                                                  State::WAYPOINT_REACHED);
+                                   return 1;
+                                 }
+                                 log_transition(current_state,
+                                                State::SEARCH_TARGET);
+                                 return 2;
+                               })
+                           .name("PLAN_PATH");
 
-    while (!target_gnss.empty()) {
-      PlanResult pr = plan();
-      if (pr == PlanResult::AT_GOAL) {
-        target_gnss.pop();
-        continue;
-      }
-      if (pr == PlanResult::FAULT)
-        return 0;
-      traverse();
-    }
-    spdlog::info("State Machine: navGPS complete");
-    return 1;
+    auto t_traverse_path =
+        taskflow.emplace([this]() -> int {
+                  TraverseResult tr = traverse();
+                  switch (tr) {
+                  case TraverseResult::REACHED:
+                  case TraverseResult::REPLAN_TIMEOUT:
+                    log_transition(current_state, State::PLAN_PATH);
+                    return 0;
+                  case TraverseResult::REPLAN_OBSTACLE:
+                    log_transition(current_state, State::RECOVER_OBSTACLE);
+                    return 1;
+                  case TraverseResult::FAULT_SLAM:
+                    log_transition(current_state, State::RECOVER_SLAM);
+                    return 2;
+                  case TraverseResult::FAULT_SERIAL:
+                    log_transition(current_state, State::FAULT_SERIAL);
+                    return 3;
+                  }
+                  return 0;
+                })
+            .name("TRAVERSE_PATH");
+
+    auto t_search = taskflow.emplace([this]() -> int {
+                              if (!search_active) {
+                                search_started_at =
+                                    std::chrono::steady_clock::now();
+                                search_active = true;
+                              }
+                              if (std::chrono::steady_clock::now() -
+                                      search_started_at >
+                                  std::chrono::seconds(60)) {
+                                search_active = false;
+                                spdlog::warn(
+                                    "Search: timeout, claiming partial credit");
+                                log_transition(current_state,
+                                               State::WAYPOINT_REACHED);
+                                return 1;
+                              }
+                              bool found =
+                                  current_waypoint.type ==
+                                          WaypointType::GPS_ARUCO
+                                      ? search_aruco()
+                                      : search_object();
+                              if (found) {
+                                search_active = false;
+                                log_transition(current_state,
+                                               State::APPROACH_TARGET);
+                                return 0;
+                              }
+                              tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(
+                                  0.0, drive_cmd.angular_z * 0.3);
+                              serial::Error err = serial::write_msg<
+                                  struct tarzan::tarzan_msg>(
+                                  serial, msg, tarzan::TARZAN_MSG_LEN);
+                              if (err != serial::Error::WriteSuccess) {
+                                log_transition(current_state,
+                                               State::FAULT_SERIAL);
+                                return 3;
+                              }
+                              return 2;
+                            })
+                        .name("SEARCH_TARGET");
+
+    auto t_approach = taskflow.emplace([this]() -> int {
+                                ApproachResult ar = approach();
+                                if (ar == ApproachResult::ARRIVED) {
+                                  log_transition(current_state,
+                                                 State::WAYPOINT_REACHED);
+                                  return 0;
+                                }
+                                if (ar == ApproachResult::LOST_TARGET) {
+                                  log_transition(current_state,
+                                                 State::SEARCH_TARGET);
+                                  return 1;
+                                }
+                                log_transition(current_state,
+                                               State::FAULT_SERIAL);
+                                return 2;
+                              })
+                          .name("APPROACH_TARGET");
+
+    auto t_wp_reached = taskflow.emplace([this]() -> int {
+                                  stop_motors();
+                                  signal_led(LedColor::GREEN);
+                                  std::this_thread::sleep_for(
+                                      std::chrono::seconds(2));
+                                  log_transition(current_state,
+                                                 State::LOAD_WAYPOINT);
+                                  return 0;
+                                })
+                            .name("WAYPOINT_REACHED");
+
+    auto t_recover_slam =
+        taskflow.emplace([this]() -> int {
+                  stop_motors();
+                  auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+                  while (std::chrono::steady_clock::now() < deadline) {
+                    if (slam::getStatus(slam_handler) == "Tracking") {
+                      log_transition(current_state, State::PLAN_PATH);
+                      return 0;
+                    }
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(200));
+                  }
+                  log_transition(current_state, State::MISSION_ABORT);
+                  return 1;
+                })
+            .name("RECOVER_SLAM");
+
+    auto t_recover_obs = taskflow.emplace([this]() -> int {
+                                   stop_motors();
+                                   current_path.reset();
+                                   std::this_thread::sleep_for(
+                                       std::chrono::milliseconds(500));
+                                   log_transition(current_state,
+                                                  State::PLAN_PATH);
+                                   return 0;
+                                 })
+                             .name("RECOVER_OBSTACLE");
+
+    auto t_fault_serial = taskflow.emplace([this]() -> int {
+                                    stop_motors();
+                                    if (++serial_retry_count > 5) {
+                                      log_transition(current_state,
+                                                     State::MISSION_ABORT);
+                                      return 1;
+                                    }
+                                    std::this_thread::sleep_for(
+                                        std::chrono::seconds(1));
+                                    log_transition(current_state,
+                                                   State::PLAN_PATH);
+                                    return 0;
+                                  })
+                              .name("FAULT_SERIAL");
+
+    auto t_mission_done = taskflow.emplace([this]() -> void {
+                                    signal_led(LedColor::GREEN);
+                                    spdlog::info(
+                                        "State Machine: mission complete");
+                                  })
+                              .name("MISSION_DONE");
+
+    auto t_mission_abort = taskflow.emplace([this]() -> void {
+                                     stop_motors();
+                                     signal_led(LedColor::RED);
+                                     spdlog::error(std::format(
+                                         "State Machine: aborted in {}",
+                                         state_name(current_state)));
+                                   })
+                               .name("MISSION_ABORT");
+
+    t_boot.precede(t_wait_map);
+    t_wait_map.precede(t_load_wp);
+    t_load_wp.precede(t_mission_done, t_plan_path);
+    t_plan_path.precede(t_traverse_path, t_wp_reached, t_search,
+                        t_fault_serial);
+    t_traverse_path.precede(t_plan_path, t_recover_obs, t_recover_slam,
+                            t_fault_serial);
+    t_search.precede(t_approach, t_wp_reached, t_search, t_fault_serial);
+    t_approach.precede(t_wp_reached, t_search, t_fault_serial);
+    t_wp_reached.precede(t_load_wp);
+    t_recover_slam.precede(t_plan_path, t_mission_abort);
+    t_recover_obs.precede(t_plan_path);
+    t_fault_serial.precede(t_plan_path, t_mission_abort);
+
+    executor.run(taskflow).wait();
+
+    return current_state == State::MISSION_DONE ? 1 : 0;
   }
 };
 
@@ -882,9 +949,9 @@ int main(int argc, char *argv[]) {
                        vm["d"].as<double>());
 
   /* yolo detector */
-  YOLO8Detector *detector = new YOLO8Detector(
-      vm["yolo_model"].as<std::string>(),
-      vm["yolo_labels"].as<std::string>());
+  YOLO8Detector *detector =
+      new YOLO8Detector(vm["yolo_model"].as<std::string>(),
+                        vm["yolo_labels"].as<std::string>());
 
   /* CONFIGURING PERIPHERALS */
   spdlog::info("Configuring Rover Peripherals...");
@@ -912,10 +979,10 @@ int main(int argc, char *argv[]) {
   }
   spdlog::info(std::format("Successful connection to {}", SERIAL_PORT));
 
-  StateMachine sm(
-      nav_ctx, pid_ctx, serial, poseQueue,
-      tarzan::DiffDriveTwist{vm["linear"].as<float>(), vm["angular"].as<float>()},
-      slam_handler, color_sub, rec, detector);
+  StateMachine sm(nav_ctx, pid_ctx, serial, poseQueue,
+                  tarzan::DiffDriveTwist{vm["linear"].as<float>(),
+                                         vm["angular"].as<float>()},
+                  slam_handler, color_sub, rec, detector);
 
   /* CONFIGURING ZMQ SOCKETS */
   try {
@@ -969,7 +1036,8 @@ int main(int argc, char *argv[]) {
     }
     std::string line;
     while (std::getline(gnss_file, line)) {
-      if (line.empty()) continue;
+      if (line.empty())
+        continue;
       std::istringstream ss(line);
       double lat, lon;
       std::string type_str = "gps";
@@ -980,16 +1048,18 @@ int main(int argc, char *argv[]) {
       }
       ss >> type_str;
       ss >> aruco_id;
-      WaypointType type = WaypointType::GPS_ONLY;
-      if (type_str == "aruco") type = WaypointType::GPS_ARUCO;
-      else if (type_str == "object") type = WaypointType::GPS_OBJECT;
+      StateMachine::WaypointType type = StateMachine::WaypointType::GPS_ONLY;
+      if (type_str == "aruco")
+        type = StateMachine::WaypointType::GPS_ARUCO;
+      else if (type_str == "object")
+        type = StateMachine::WaypointType::GPS_OBJECT;
       sm.waypoints.push({lat, lon, type, aruco_id});
     }
     gnss_file.close();
   }
   spdlog::info(std::format("Loaded {} GNSS waypoints", sm.waypoints.size()));
 
-  sm.navGPS();
+  sm.run();
 
   /* CLEANUP */
   capture_thread.join();

@@ -92,7 +92,14 @@ auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
       rs2::points points = rs_ptr->pc.calculate(depthFrame);
       const rs2::vertex *vertices = points.get_vertices();
       std::vector<float> vertices_vector;
+      vertices_vector.reserve(points.size() * 3);
       for (size_t i = 0; i < points.size(); i++) {
+        /* realsense encodes "no depth here" as an exact (0,0,0) vertex. Those
+           are finite, so no downstream PCL filter drops them — left in, they
+           collapse onto the camera origin and become a phantom obstacle under
+           the rover. */
+        if (vertices[i].z <= 0.0f)
+          continue;
         vertices_vector.push_back(vertices[i].x);
         vertices_vector.push_back(vertices[i].y);
         vertices_vector.push_back(vertices[i].z);
@@ -137,7 +144,7 @@ auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
 
 /* function to get slam pose */
 auto localize(struct slam::slamHandle *slam_handler,
-              utils::SafeQueue<struct slam::slamPose> &poseQueue,
+              utils::SharedLatest<struct slam::slamPose> &poseState,
               zmq::socket_t &sub, const rerun::RecordingStream &rec,
               utils::rs_config realsense_config) -> void {
 
@@ -160,6 +167,9 @@ auto localize(struct slam::slamHandle *slam_handler,
 
     if (!result_color.has_value() || !result_depth.has_value() ||
         !result_timestamp.has_value()) {
+      colorFrameMsg.clear();
+      depthFrameMsg.clear();
+      timestampMsg.clear();
       continue;
     }
 
@@ -180,7 +190,7 @@ auto localize(struct slam::slamHandle *slam_handler,
     float yaw = slam::yawfromPose(current_pose);
 
     struct slam::slamPose pose = {.x = x, .y = y, .z = z, .yaw = yaw};
-    poseQueue.produce(std::move(pose));
+    poseState.set(pose);
 
     std::string coordinates = std::format("x: {} y: {} yaw: {}", x, y, yaw);
     rec.log("SlamPose", rerun::TextLog(coordinates));
@@ -193,7 +203,7 @@ auto localize(struct slam::slamHandle *slam_handler,
 
 /* function to create gridmap  */
 auto mapping(nav::navContext *nav_ctx,
-             utils::SafeQueue<struct slam::slamPose> &poseQueue,
+             utils::SharedLatest<struct slam::slamPose> &poseState,
              zmq::socket_t &sub, const rerun::RecordingStream &rec,
              utils::rs_config realsense_config) -> void {
 
@@ -207,10 +217,12 @@ auto mapping(nav::navContext *nav_ctx,
 
   while (true) {
 
+    pointcloud_msg.clear();
+
     result_pointcloud =
         zmq::recv_multipart(sub, std::back_inserter(pointcloud_msg));
 
-    if (!result_pointcloud.has_value())
+    if (!result_pointcloud.has_value() || pointcloud_msg.size() < 2)
       continue;
 
     points_buffer.resize(pointcloud_msg[1].size() / sizeof(float));
@@ -230,13 +242,21 @@ auto mapping(nav::navContext *nav_ctx,
       cloud->points[i].z = points_buffer[i * 3 + 2];
     }
 
-    if (!poseQueue.consume(pose)) {
-      spdlog::error("GridMap : Unable to fetch data from Pose Queue");
+    if (!poseState.get(pose)) {
+      spdlog::warn("GridMap : No pose available yet, skipping cloud");
       continue;
     }
 
+    /* cloud is in the camera optical frame; lift it into the SLAM world frame
+       via camera->base, then the rover's own heading. Dropping the yaw term
+       stamps obstacles into the map as if the rover never turned. */
+    const Eigen::Matrix3d R_yaw =
+        Eigen::AngleAxisd(pose.yaw, Eigen::Vector3d::UnitZ())
+            .toRotationMatrix();
+
+    T_pc.setIdentity();
+    T_pc.linear() = R_yaw * utils::T_camera_base.block<3, 3>(0, 0);
     T_pc.translation() = Eigen::Vector3d(pose.x, pose.y, pose.z);
-    T_pc.linear() = utils::T_camera_base.block<3, 3>(0, 0);
 
     nav::preProcessPointCloud(nav_ctx, cloud, T_pc.matrix());
     nav::processGridMapCells(nav_ctx, cloud);
@@ -245,8 +265,6 @@ auto mapping(nav::navContext *nav_ctx,
     std::lock_guard<std::mutex> lock(map_sync.mtx);
     map_sync.flag = true;
     map_sync.cv.notify_all();
-
-    pointcloud_msg.clear();
   }
 }
 
@@ -385,10 +403,15 @@ private:
         return TraverseResult::FAULT_SLAM;
 
       slam::slamPose pose;
-      if (!poseQueue.consume(pose)) {
-        spdlog::error("State Machine : Unable to fetch data from Pose Queue");
+      if (!poseState.get(pose)) {
+        spdlog::error("State Machine : No pose available yet");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       }
+
+      /* the pose read no longer blocks on a queue, so pace the control loop
+         here instead — otherwise this spins and floods the serial port */
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
       grid_map::Position gm_pos(pose.x, pose.y);
       grid_map::Index gm_idx;
@@ -579,7 +602,7 @@ private:
 
   auto plan() -> PlanResult {
     slam::slamPose pose;
-    if (!poseQueue.consume(pose)) {
+    if (!poseState.get(pose)) {
       spdlog::error("plan: unable to fetch pose");
       return PlanResult::FAULT;
     }
@@ -628,7 +651,7 @@ public:
   struct nav::navContext *nav_ctx;
   struct control::Pid *pid_ctx;
   boost::asio::serial_port *serial;
-  utils::SafeQueue<struct slam::slamPose> &poseQueue;
+  utils::SharedLatest<struct slam::slamPose> &poseState;
   tarzan::DiffDriveTwist drive_cmd;
   slam::slamHandle *slam_handler;
   ob::PathPtr current_path;
@@ -645,11 +668,11 @@ public:
 
   StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
                boost::asio::serial_port *ser,
-               utils::SafeQueue<struct slam::slamPose> &queue,
+               utils::SharedLatest<struct slam::slamPose> &pose_state,
                tarzan::DiffDriveTwist cmd, slam::slamHandle *sh,
                zmq::socket_t &csub, const rerun::RecordingStream &r,
                YOLO8Detector *det)
-      : nav_ctx(nav), pid_ctx(pid), serial(ser), poseQueue(queue),
+      : nav_ctx(nav), pid_ctx(pid), serial(ser), poseState(pose_state),
         drive_cmd(cmd), slam_handler(sh), color_sub(csub), rec(r),
         detector(det) {};
 
@@ -932,7 +955,7 @@ int main(int argc, char *argv[]) {
 
   /* slam vars */
   struct slam::slamHandle *slam_handler = new slam::slamHandle();
-  utils::SafeQueue<struct slam::slamPose> poseQueue;
+  utils::SharedLatest<struct slam::slamPose> poseState;
 
   /* path planning vars */
   struct nav::navContext *nav_ctx =
@@ -979,7 +1002,7 @@ int main(int argc, char *argv[]) {
   }
   spdlog::info(std::format("Successful connection to {}", SERIAL_PORT));
 
-  StateMachine sm(nav_ctx, pid_ctx, serial, poseQueue,
+  StateMachine sm(nav_ctx, pid_ctx, serial, poseState,
                   tarzan::DiffDriveTwist{vm["linear"].as<float>(),
                                          vm["angular"].as<float>()},
                   slam_handler, color_sub, rec, detector);
@@ -1020,10 +1043,10 @@ int main(int argc, char *argv[]) {
 
   /* LAUNCHING BACKGROUND THREADS */
   std::thread capture_thread(capture_frame, rs_ptr, std::ref(pub));
-  std::thread localize_thread(localize, slam_handler, std::ref(poseQueue),
+  std::thread localize_thread(localize, slam_handler, std::ref(poseState),
                               std::ref(slam_sub), std::ref(rec),
                               realsense_config);
-  std::thread mapping_thread(mapping, nav_ctx, std::ref(poseQueue),
+  std::thread mapping_thread(mapping, nav_ctx, std::ref(poseState),
                              std::ref(mapping_sub), std::ref(rec),
                              realsense_config);
 

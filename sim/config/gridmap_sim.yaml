@@ -1,0 +1,36 @@
+# Grid map / planner parameters for the Webots sim.
+# Schema is whatever nav::loadParameters() in src/nav.cpp reads -- keys are
+# not optional, a missing one throws out of yaml-cpp.
+
+grid_map:
+  # setGeometry() centres the map on the origin, so this spans [-10, 10] on
+  # both axes. See the note in sim/README.md about setupNav() giving OMPL
+  # bounds of [0, x] instead, which does not match this centring.
+  x: 20.0
+  y: 20.0
+  resolution: 0.10
+  min_grid_points: 3
+  pos_obstacle_threshold: 0.25
+  neg_obstacle_threshold: -0.25
+
+filters:
+  min_filtering_points: 100
+  # Applied after the cloud is transformed into the base FLU frame:
+  # x forward, y left, z up.
+  passthrough_filter:
+    x:
+      min_limit: 0.3
+      max_limit: 10.0
+    y:
+      min_limit: -5.0
+      max_limit: 5.0
+    z:
+      min_limit: -1.0
+      max_limit: 2.0
+  voxel_size:
+    x: 0.05
+    y: 0.05
+    z: 0.05
+
+planner:
+  time_to_solve: 1.0

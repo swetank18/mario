@@ -1,0 +1,24 @@
+# GNSS waypoints for the Webots mars_yard world.
+#
+# Format, as parsed by main() in src/mario.cpp:
+#   <lat> <lon> [gps|aruco|object] [aruco_id]
+# Anything after the first two columns is optional; the type defaults to gps.
+#
+# NOTE: mario.cpp's parser has no comment handling -- it warns and skips any
+# line whose first two fields are not numbers, so these '#' lines are dropped
+# with a "Skipping malformed GNSS line" warning. That is noisy but harmless.
+#
+# Coordinates are derived from the world's local ENU metres against the
+# bridge's LAT0/LON0 (38.406, -110.792) using the same equirectangular model
+# plan() inverts, so each waypoint lands exactly where intended:
+#
+#   WP1  ENU (14,  0)  GPS_ONLY    -> tests PLAN -> TRAVERSE -> WAYPOINT_REACHED
+#                                     (rocks at x~6 force a non-straight path)
+#   WP2  ENU (24,  8)  GPS_ARUCO 1 -> marker board sits 2 m beyond at (26, 8),
+#                                     tests SEARCH_TARGET -> APPROACH_TARGET
+#   WP3  ENU (24, -8)  GPS_OBJECT  -> traffic cone 2 m beyond at (26, -8),
+#                                     tests the YOLO search path
+#
+38.406000000 -110.791839510 gps
+38.406071865 -110.791724875 aruco 1
+38.405928135 -110.791724875 object

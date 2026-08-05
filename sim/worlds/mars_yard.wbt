@@ -1,0 +1,246 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "../protos/MarioRover.proto"
+EXTERNPROTO "../protos/ArucoMarker.proto"
+
+# Mars-yard style course for the URC autonomy mission.
+#
+# Deliberately self-contained: every PROTO and texture is local, so the world
+# loads with no network. Nothing here uses the remote cyberbotics EXTERNPROTOs.
+#
+# gpsCoordinateSystem stays "local" on purpose. The bridge controller converts
+# local ENU metres to lat/lon itself using the same equirectangular model that
+# plan() in src/mario.cpp inverts (EARTH_RADIUS 6378137.0), so the round trip
+# is exact. Letting Webots do the WGS84 conversion would introduce a second,
+# subtly different earth model.
+
+WorldInfo {
+  info [
+    "Mars yard for the Team Rudra 'mario' autonomy FSM."
+    "Rover starts at the origin facing East (+X)."
+  ]
+  title "Mario Mars Yard"
+  basicTimeStep 16
+  FPS 30
+  coordinateSystem "ENU"
+  gpsCoordinateSystem "local"
+  lineScale 0.5
+  contactProperties [
+    ContactProperties {
+      material1 "rover_wheel"
+      material2 "default"
+      coulombFriction [
+        0.9
+      ]
+      softCFM 0.0004
+      bounce 0
+    }
+  ]
+}
+Viewpoint {
+  orientation -0.32 0.30 0.90 1.75
+  position -9.0 -7.5 8.5
+  follow "mario"
+  followSmoothness 0.2
+}
+Background {
+  skyColor [
+    0.62 0.42 0.30
+  ]
+  luminosity 1.1
+}
+DirectionalLight {
+  ambientIntensity 0.55
+  direction -0.55 -0.35 -1
+  intensity 2.2
+  castShadows TRUE
+}
+DirectionalLight {
+  ambientIntensity 0.4
+  direction 0.6 0.5 -0.5
+  intensity 0.8
+}
+
+# ---------------------------------------------------------------- terrain
+# The texture tile spans 10 m, so the 2048px image gives roughly 200 px/m of
+# detail. That density is what keeps stella_vslam tracking; a flat-coloured
+# floor loses tracking on the first frame and drops the FSM into RECOVER_SLAM.
+DEF GROUND Solid {
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../textures/mars_ground.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+        textureTransform TextureTransform {
+          scale 8 8
+        }
+      }
+      geometry DEF GROUND_GEOM Box {
+        size 80 80 0.2
+      }
+    }
+  ]
+  name "ground"
+  boundingObject USE GROUND_GEOM
+}
+
+# ---------------------------------------------------------------- obstacles
+# ROCK_A/B/C sit across the straight line from the start to waypoint 1, so
+# OMPL has to plan around them rather than emit a straight path.
+DEF ROCK_A Solid {
+  translation 6.0 0.6 0.45
+  children [
+    DEF ROCK_SHAPE_L Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../textures/rock.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Sphere {
+        radius 0.9
+        subdivision 3
+      }
+    }
+  ]
+  name "rock_a"
+  boundingObject USE ROCK_SHAPE_L
+}
+DEF ROCK_B Solid {
+  translation 6.4 -1.4 0.35
+  children [
+    DEF ROCK_SHAPE_M Shape {
+      appearance PBRAppearance {
+        baseColorMap ImageTexture {
+          url [
+            "../textures/rock.jpg"
+          ]
+        }
+        roughness 1
+        metalness 0
+      }
+      geometry Sphere {
+        radius 0.7
+        subdivision 3
+      }
+    }
+  ]
+  name "rock_b"
+  boundingObject USE ROCK_SHAPE_M
+}
+DEF ROCK_C Solid {
+  translation 6.2 2.6 0.4
+  children [
+    USE ROCK_SHAPE_M
+  ]
+  name "rock_c"
+  boundingObject USE ROCK_SHAPE_M
+}
+DEF ROCK_D Solid {
+  translation 17.0 3.5 0.5
+  children [
+    USE ROCK_SHAPE_L
+  ]
+  name "rock_d"
+  boundingObject USE ROCK_SHAPE_L
+}
+DEF ROCK_E Solid {
+  translation 19.5 -4.0 0.4
+  children [
+    USE ROCK_SHAPE_M
+  ]
+  name "rock_e"
+  boundingObject USE ROCK_SHAPE_M
+}
+DEF ROCK_F Solid {
+  translation -5.0 6.0 0.45
+  children [
+    USE ROCK_SHAPE_L
+  ]
+  name "rock_f"
+  boundingObject USE ROCK_SHAPE_L
+}
+DEF ROCK_G Solid {
+  translation 11.0 -6.5 0.35
+  children [
+    USE ROCK_SHAPE_M
+  ]
+  name "rock_g"
+  boundingObject USE ROCK_SHAPE_M
+}
+
+# ------------------------------------------------- waypoint 2 target (ArUco)
+# Faces -X so the rover, arriving from the west, reads it head on.
+ArucoMarker {
+  translation 26.0 8.0 0
+  name "aruco_1"
+  texture "../textures/aruco_1.png"
+}
+
+# ------------------------------------------------ waypoint 3 target (object)
+# YOLO class "cone" from model/labels.names.
+DEF CONE Solid {
+  translation 26.0 -8.0 0
+  children [
+    Pose {
+      translation 0 0 0.35
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.95 0.32 0.03
+            roughness 0.6
+            metalness 0
+          }
+          geometry DEF CONE_GEOM Cone {
+            bottomRadius 0.22
+            height 0.70
+            subdivision 20
+          }
+        }
+      ]
+    }
+    Pose {
+      translation 0 0 0.02
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.12 0.12 0.12
+            roughness 0.9
+            metalness 0
+          }
+          geometry Box {
+            size 0.42 0.42 0.04
+          }
+        }
+      ]
+    }
+  ]
+  name "cone"
+  # Webots rejects Cone in a boundingObject, so collision uses a cylinder of
+  # the same height. Only the visual mesh needs to be cone-shaped for YOLO.
+  boundingObject Pose {
+    translation 0 0 0.35
+    children [
+      Cylinder {
+        radius 0.20
+        height 0.70
+      }
+    ]
+  }
+}
+
+# ---------------------------------------------------------------- the rover
+MarioRover {
+  translation 0 0 0.02
+  rotation 0 0 1 0
+  name "mario"
+  controller "mario_bridge"
+}

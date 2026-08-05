@@ -930,7 +930,16 @@ int main(int argc, char *argv[]) {
       "linear", po::value<float>(), "max linear velocity")(
       "angular", po::value<float>(), "max angular velocity")(
       "yolo_model", po::value<std::string>(), "path to YOLO ONNX model")(
-      "yolo_labels", po::value<std::string>(), "path to YOLO class labels");
+      "yolo_labels", po::value<std::string>(), "path to YOLO class labels")(
+      "sim", po::bool_switch(),
+      "simulation mode: frames come from an external publisher (the Webots "
+      "mario_bridge controller) instead of an attached RealSense")(
+      "zmq_endpoint", po::value<std::string>()->default_value("inproc://realsense"),
+      "frame transport endpoint; must not be inproc:// when --sim is set")(
+      "slam_config", po::value<std::string>()->default_value("stellaconf.yaml"),
+      "stella_vslam camera config")(
+      "slam_vocab", po::value<std::string>()->default_value("orb_vocab.fbow"),
+      "stella_vslam ORB vocabulary");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -939,6 +948,17 @@ int main(int argc, char *argv[]) {
   if (vm.count("help")) {
     std::cout << desc << "\n";
     return 1;
+  }
+
+  /* In sim the Webots mario_bridge controller owns the PUB socket, so frames
+     have to cross a process boundary -- inproc:// cannot reach it. */
+  const bool sim_mode = vm["sim"].as<bool>();
+  const std::string zmq_endpoint = vm["zmq_endpoint"].as<std::string>();
+  if (sim_mode && zmq_endpoint.rfind("inproc://", 0) == 0) {
+    spdlog::error("--sim needs an inter-process --zmq_endpoint "
+                  "(e.g. tcp://127.0.0.1:5599), got {}",
+                  zmq_endpoint);
+    return -1;
   }
 
   /* zmq vars */
@@ -951,10 +971,11 @@ int main(int argc, char *argv[]) {
   /* realsense vars */
   struct utils::rs_config realsense_config{
       .height = 640, .width = 480, .fps = 30, .enable_imu = false};
-  struct utils::rs_handler *rs_ptr;
+  struct utils::rs_handler *rs_ptr = nullptr;
 
   /* slam vars */
-  struct slam::slamHandle *slam_handler = new slam::slamHandle();
+  struct slam::slamHandle *slam_handler = new slam::slamHandle(
+      vm["slam_config"].as<std::string>(), vm["slam_vocab"].as<std::string>());
   utils::SharedLatest<struct slam::slamPose> poseState;
 
   /* path planning vars */
@@ -980,15 +1001,20 @@ int main(int argc, char *argv[]) {
   spdlog::info("Configuring Rover Peripherals...");
 
   /* CONFIGURING REALSENSE */
-  rs_ptr = utils::setupRealsense(realsense_config);
-  if (not rs_ptr) {
-    spdlog::error("Unable to setup Realsense");
-    return -1;
-  }
-  spdlog::info("Successful setup of Realsense");
-  rs2::frame frame;
-  for (int i = 0; i < 100; i++) {
-    frame = rs_ptr->frame_q.wait_for_frame();
+  if (sim_mode) {
+    spdlog::info("Sim mode: skipping Realsense, expecting frames on {}",
+                 zmq_endpoint);
+  } else {
+    rs_ptr = utils::setupRealsense(realsense_config);
+    if (not rs_ptr) {
+      spdlog::error("Unable to setup Realsense");
+      return -1;
+    }
+    spdlog::info("Successful setup of Realsense");
+    rs2::frame frame;
+    for (int i = 0; i < 100; i++) {
+      frame = rs_ptr->frame_q.wait_for_frame();
+    }
   }
 
   /* CONFIGURING NUCLEO COM */
@@ -1008,15 +1034,19 @@ int main(int argc, char *argv[]) {
                   slam_handler, color_sub, rec, detector);
 
   /* CONFIGURING ZMQ SOCKETS */
-  try {
-    pub.bind("inproc://realsense");
-  } catch (zmq::error_t &e) {
-    spdlog::error(e.what());
+  /* Only bind when we are the publisher. In sim the bridge has already bound
+     this endpoint and binding it again would fail. */
+  if (!sim_mode) {
+    try {
+      pub.bind(zmq_endpoint);
+    } catch (zmq::error_t &e) {
+      spdlog::error(e.what());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
   try {
-    slam_sub.connect("inproc://realsense");
+    slam_sub.connect(zmq_endpoint);
     slam_sub.set(zmq::sockopt::subscribe, topic_color);
     slam_sub.set(zmq::sockopt::subscribe, topic_depth);
     slam_sub.set(zmq::sockopt::subscribe, topic_timestamp);
@@ -1025,14 +1055,14 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    mapping_sub.connect("inproc://realsense");
+    mapping_sub.connect(zmq_endpoint);
     mapping_sub.set(zmq::sockopt::subscribe, topic_pointcloud);
   } catch (zmq::error_t &e) {
     spdlog::error(e.what());
   }
 
   try {
-    color_sub.connect("inproc://realsense");
+    color_sub.connect(zmq_endpoint);
     color_sub.set(zmq::sockopt::subscribe, topic_color);
   } catch (zmq::error_t &e) {
     spdlog::error(e.what());
@@ -1042,7 +1072,10 @@ int main(int argc, char *argv[]) {
   rec.connect_grpc(rerun_url).exit_on_failure();
 
   /* LAUNCHING BACKGROUND THREADS */
-  std::thread capture_thread(capture_frame, rs_ptr, std::ref(pub));
+  /* In sim the bridge publishes the frames, so there is nothing to capture. */
+  std::thread capture_thread;
+  if (!sim_mode)
+    capture_thread = std::thread(capture_frame, rs_ptr, std::ref(pub));
   std::thread localize_thread(localize, slam_handler, std::ref(poseState),
                               std::ref(slam_sub), std::ref(rec),
                               realsense_config);
@@ -1085,7 +1118,8 @@ int main(int argc, char *argv[]) {
   sm.run();
 
   /* CLEANUP */
-  capture_thread.join();
+  if (capture_thread.joinable())
+    capture_thread.join();
   localize_thread.join();
   mapping_thread.join();
 
@@ -1093,7 +1127,8 @@ int main(int argc, char *argv[]) {
   delete nav_ctx;
   delete pid_ctx;
   delete detector;
-  utils::destroyHandle(rs_ptr);
+  if (rs_ptr)
+    utils::destroyHandle(rs_ptr);
   serial::close(serial);
 
   return 0;

@@ -1,0 +1,96 @@
+# stella_vslam config for the Webots sim.
+#
+# Same as ../../stellaconf.yaml except for the intrinsics, because a Webots
+# camera is an ideal pinhole:
+#   cx/cy  324.637/242.462 -> 320.0/240.0  (image is exactly centred)
+#   fy     617.362         -> 617.201      (pixels are exactly square)
+#   distortion already zero in both, and Webots renders none.
+# fx follows from the PROTO's fieldOfView 0.9566279 = 2*atan(320/617.201).
+
+#==============#
+# Camera Model #
+#==============#
+
+Camera:
+  name: "Webots MarioRover RGBD"
+  setup: "RGBD"
+  model: "perspective"
+
+  fx: 617.201
+  fy: 617.201
+  cx: 320.0
+  cy: 240.0
+
+  k1: 0.0
+  k2: 0.0
+  p1: 0.0
+  p2: 0.0
+  k3: 0.0
+
+  fps: 15.0
+  cols: 640
+  rows: 480
+  focal_x_baseline: 40.0
+  depth_threshold: 40.0
+
+  color_order: "RGB"
+
+#=====================#
+# Tracking Parameters #
+#=====================#
+Tracking:
+  backend: "g2o"
+  enable_temporal_keyframe_only_tracking: false
+  margin_last_frame_projection: 10.0
+
+Preprocessing:
+  min_size: 400
+  depthmap_factor: 1000 # bridge publishes uint16 millimetres
+
+#================#
+# ORB Parameters #
+#================#
+
+Feature:
+  name: "default ORB feature extraction setting"
+  scale_factor: 1.2
+  num_levels: 8
+  ini_fast_threshold: 20
+  min_fast_threshold: 7
+
+#====================#
+# Mapping Parameters #
+#====================#
+
+Mapping:
+  baseline_dist_thr_ratio: 0.02
+  redundant_obs_ratio_thr: 0.9
+  num_covisibilities_for_landmark_generation: 20
+  num_covisibilities_for_landmark_fusion: 20
+  erase_temporal_keyframes: false
+  num_temporal_keyframes: 15
+
+Relocalizer:
+  search_neighbor: True
+
+KeyframeInserter:
+  wait_for_local_bundle_adjustment: false
+
+LoopDetector:
+  backend: "g2o"
+
+#===========================#
+# PangolinViewer Parameters #
+#===========================#
+
+PangolinViewer:
+  keyframe_size: 0.05
+  keyframe_line_width: 1
+  graph_line_width: 1
+  point_size: 2
+  camera_size: 0.08
+  camera_line_width: 3
+  viewpoint_x: 0
+  viewpoint_y: -0.9
+  viewpoint_z: -1.9
+  viewpoint_f: 400

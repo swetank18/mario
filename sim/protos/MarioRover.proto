@@ -1,0 +1,275 @@
+#VRML_SIM R2025a utf8
+# license: Apache License 2.0
+# documentation url: https://github.com/swetank18/mario
+# tags: static
+# A four-wheel skid-steer rover standing in for the Team Rudra chassis.
+#
+# The sensor suite is chosen to match exactly what src/mario.cpp consumes:
+#   camera + range-finder -> the RealSense D435i RGB-D pair feeding stella_vslam,
+#                            the OMPL grid map, YOLO and the ArUco detector
+#   gps + compass         -> the geodetic_msg (lat/lon/alt/head) that plan()
+#                            reads back over the Nucleo serial link
+#
+# Camera fieldOfView is 0.9566279 rad = 2*atan(320/617.201), the horizontal FOV
+# implied by fx in stellaconf.yaml. That reproduces fx to within 1e-4 px. Keep
+# the two in sync or stella_vslam triangulates against the wrong intrinsics and
+# drifts. Only cx/cy differ from the real D435i, because a Webots camera is an
+# ideal pinhole centred on the image -- hence sim/config/stellaconf_sim.yaml.
+#
+# Wheel radius (0.15 m) and half-track (0.32 m) are hardcoded below. Webots
+# PROTOs cannot do arithmetic on parameters without a Lua template, so they
+# cannot be exposed as fields and reused across the four wheels. The bridge
+# controller carries the same two constants to convert a DiffDriveTwist into
+# wheel velocities -- change one and you must change the other.
+# See wheel_radius / half_track in controllers/mario_bridge/mario_bridge.cpp.
+
+PROTO MarioRover [
+  field SFVec3f    translation     0 0 0
+  field SFRotation rotation        0 0 1 0
+  field SFString   name            "mario"
+  field SFString   controller      "mario_bridge"
+  field MFString   controllerArgs  []
+  field SFString   customData      ""
+  field SFBool     supervisor      FALSE
+  field SFBool     synchronization TRUE
+  field SFFloat    bodyMass        18.0
+  field SFInt32    cameraWidth     640
+  field SFInt32    cameraHeight    480
+  field SFFloat    cameraFov       0.9566279
+  field SFFloat    depthMaxRange   40.0     # matches depth_threshold in stellaconf.yaml
+  field MFNode     payload         []       # e.g. the arm meshes, for looks
+]
+{
+  Robot {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    controller IS controller
+    controllerArgs IS controllerArgs
+    customData IS customData
+    supervisor IS supervisor
+    synchronization IS synchronization
+    model "Mario Rover"
+    children [
+      # ---------------- chassis ----------------
+      DEF BODY Pose {
+        translation 0 0 0.30
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.72 0.62 0.42
+              roughness 0.7
+              metalness 0.1
+            }
+            geometry Box {
+              size 0.90 0.56 0.24
+            }
+          }
+        ]
+      }
+
+      # sensor mast, front of the chassis
+      DEF MAST Pose {
+        translation 0.36 0 0.46
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.30 0.30 0.33
+              roughness 0.5
+              metalness 0.6
+            }
+            geometry Box {
+              size 0.06 0.10 0.32
+            }
+          }
+        ]
+      }
+
+      # ---------------- sensors ----------------
+      # Webots cameras look down +X with +Y left and +Z up, so an identity
+      # rotation here already points the sensor forward along the rover's
+      # heading. The controller converts to the OpenCV optical convention
+      # (x right, y down, z forward) when it unprojects the depth image,
+      # because that is the frame utils::T_camera_base expects.
+      Camera {
+        name "camera"
+        translation 0.40 0 0.62
+        width IS cameraWidth
+        height IS cameraHeight
+        fieldOfView IS cameraFov
+        near 0.05
+        antiAliasing TRUE
+      }
+      RangeFinder {
+        name "range-finder"
+        translation 0.40 0 0.62
+        width IS cameraWidth
+        height IS cameraHeight
+        fieldOfView IS cameraFov
+        near 0.05
+        minRange 0.10
+        maxRange IS depthMaxRange
+      }
+      GPS {
+        name "gps"
+        translation 0 0 0.42
+      }
+      Compass {
+        name "compass"
+        translation 0 0 0.42
+      }
+
+      # ---------------- wheels ----------------
+      DEF WHEEL_FL HingeJoint {
+        jointParameters HingeJointParameters {
+          axis 0 1 0
+          anchor 0.30 0.32 0.15
+        }
+        device [
+          RotationalMotor {
+            name "wheel_fl"
+            maxVelocity 30
+            maxTorque 60
+          }
+          PositionSensor {
+            name "wheel_fl_sensor"
+          }
+        ]
+        endPoint Solid {
+          translation 0.30 0.32 0.15
+          rotation 1 0 0 1.5708
+          name "wheel_fl_solid"
+          contactMaterial "rover_wheel"
+          children [
+            DEF WHEEL_SHAPE Shape {
+              appearance PBRAppearance {
+                baseColor 0.13 0.13 0.13
+                roughness 0.9
+                metalness 0
+              }
+              geometry Cylinder {
+                radius 0.15
+                height 0.10
+                subdivision 24
+              }
+            }
+          ]
+          boundingObject USE WHEEL_SHAPE
+          physics Physics {
+            density -1
+            mass 1.5
+          }
+        }
+      }
+      DEF WHEEL_FR HingeJoint {
+        jointParameters HingeJointParameters {
+          axis 0 1 0
+          anchor 0.30 -0.32 0.15
+        }
+        device [
+          RotationalMotor {
+            name "wheel_fr"
+            maxVelocity 30
+            maxTorque 60
+          }
+          PositionSensor {
+            name "wheel_fr_sensor"
+          }
+        ]
+        endPoint Solid {
+          translation 0.30 -0.32 0.15
+          rotation 1 0 0 1.5708
+          name "wheel_fr_solid"
+          contactMaterial "rover_wheel"
+          children [
+            USE WHEEL_SHAPE
+          ]
+          boundingObject USE WHEEL_SHAPE
+          physics Physics {
+            density -1
+            mass 1.5
+          }
+        }
+      }
+      DEF WHEEL_RL HingeJoint {
+        jointParameters HingeJointParameters {
+          axis 0 1 0
+          anchor -0.30 0.32 0.15
+        }
+        device [
+          RotationalMotor {
+            name "wheel_rl"
+            maxVelocity 30
+            maxTorque 60
+          }
+          PositionSensor {
+            name "wheel_rl_sensor"
+          }
+        ]
+        endPoint Solid {
+          translation -0.30 0.32 0.15
+          rotation 1 0 0 1.5708
+          name "wheel_rl_solid"
+          contactMaterial "rover_wheel"
+          children [
+            USE WHEEL_SHAPE
+          ]
+          boundingObject USE WHEEL_SHAPE
+          physics Physics {
+            density -1
+            mass 1.5
+          }
+        }
+      }
+      DEF WHEEL_RR HingeJoint {
+        jointParameters HingeJointParameters {
+          axis 0 1 0
+          anchor -0.30 -0.32 0.15
+        }
+        device [
+          RotationalMotor {
+            name "wheel_rr"
+            maxVelocity 30
+            maxTorque 60
+          }
+          PositionSensor {
+            name "wheel_rr_sensor"
+          }
+        ]
+        endPoint Solid {
+          translation -0.30 -0.32 0.15
+          rotation 1 0 0 1.5708
+          name "wheel_rr_solid"
+          contactMaterial "rover_wheel"
+          children [
+            USE WHEEL_SHAPE
+          ]
+          boundingObject USE WHEEL_SHAPE
+          physics Physics {
+            density -1
+            mass 1.5
+          }
+        }
+      }
+
+      Group {
+        children IS payload
+      }
+    ]
+    boundingObject Pose {
+      translation 0 0 0.30
+      children [
+        Box {
+          size 0.90 0.56 0.24
+        }
+      ]
+    }
+    physics Physics {
+      density -1
+      mass IS bodyMass
+      centerOfMass [
+        0 0 0.26
+      ]
+    }
+  }
+}

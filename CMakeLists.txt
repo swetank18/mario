@@ -32,6 +32,9 @@ find_package(spdlog REQUIRED)
 find_package(grid_map_core REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(ompl 1.7.0 REQUIRED)
+# pkg_check_modules is only defined once FindPkgConfig has been included; it
+# happened to work when some other find_package pulled it in first.
+find_package(PkgConfig REQUIRED)
 pkg_check_modules(Asio asio)
 pkg_check_modules(Cobs cobs)
 
@@ -92,10 +95,13 @@ if(BUILD_TESTS)
   target_include_directories(pid_test PRIVATE pid slam serial)
   target_link_libraries(pid_test PRIVATE pid slam serial)
 
-  # aurco test
-  add_executable(aruco_test src/aruco.cpp)
-  target_include_directories(aruco_test PUBLIC ${OpenCV_INCLUDE_DIRS})
-  target_link_libraries(aruco_test PUBLIC ${OpenCV_LIBS})
+  # aruco test -- src/aruco.cpp is not in the tree, so only wire this up if it
+  # reappears. Referencing it unconditionally fails the configure step.
+  if(EXISTS ${CMAKE_SOURCE_DIR}/src/aruco.cpp)
+    add_executable(aruco_test src/aruco.cpp)
+    target_include_directories(aruco_test PUBLIC ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(aruco_test PUBLIC ${OpenCV_LIBS})
+  endif()
 
 endif()
 

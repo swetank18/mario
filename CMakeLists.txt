@@ -60,11 +60,24 @@ target_link_libraries(
   slam PUBLIC utils rerun_sdk Eigen3::Eigen stella_vslam::stella_vslam
               ${GLEW_LIBS} ${Pangolin_LIBS})
 
-# nav
-add_library(nav src/nav.cpp)
-target_include_directories(nav PUBLIC include ${PCL_INCLUDE_DIRS})
-target_link_libraries(nav PUBLIC ${PCL_LIBRARIES} Eigen3::Eigen grid_map_core
-                                 yaml-cpp ompl::ompl)
+# nav: parameter loading
+add_library(nav_params src/nav/params.cpp)
+target_include_directories(nav_params PUBLIC include)
+target_link_libraries(nav_params PUBLIC yaml-cpp)
+
+# nav: occupancy mapping — owns grid_map, PCL, rerun
+add_library(nav_map src/nav/occupancy_map.cpp)
+target_include_directories(nav_map PUBLIC include ${PCL_INCLUDE_DIRS}
+                                          ${rerun_sdk_INCLUDE_DIRS})
+target_link_libraries(nav_map PUBLIC nav_params ${PCL_LIBRARIES} Eigen3::Eigen
+                                     grid_map_core rerun_sdk spdlog::spdlog)
+
+# nav: planning — owns OMPL. Deliberately does NOT link nav_map: the planners
+# reach the map through include/nav/map_query.hpp, which has no headers of its
+# own, so nothing on the mapping side can leak across.
+add_library(nav_planner src/nav/planner_ompl.cpp src/nav/planner_astar.cpp)
+target_include_directories(nav_planner PUBLIC include)
+target_link_libraries(nav_planner PUBLIC nav_params ompl::ompl spdlog::spdlog)
 
 # pid
 add_library(pid src/pid.cpp)
@@ -119,7 +132,8 @@ endif()
 
 add_executable(mario ${CMAKE_SOURCE_DIR}/src/mario.cpp)
 
-target_include_directories(mario PRIVATE yasmin slam serial utils nav pid)
+target_include_directories(mario PRIVATE yasmin slam serial utils nav_map
+                                         nav_planner pid)
 
 target_link_libraries(
   mario
@@ -128,5 +142,6 @@ target_link_libraries(
           slam
           utils
           serial
-          nav
+          nav_map
+          nav_planner
           pid)

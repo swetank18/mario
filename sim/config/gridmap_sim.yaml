@@ -1,18 +1,26 @@
 # Grid map / planner parameters for the Webots sim.
-# Schema is whatever nav::loadParameters() in src/nav.cpp reads -- keys are
-# not optional, a missing one throws out of yaml-cpp.
+# Schema is what nav::loadMapParams() and nav::loadPlannerParams() in
+# src/nav/params.cpp read. Every key is optional now -- a missing one falls
+# back to the default in include/nav/params.hpp instead of throwing.
 
 grid_map:
   # setGeometry() centres the map on the origin, so this spans [-10, 10] on
-  # both axes, and setupNav() gives OMPL matching bounds. The map is never
-  # recentred though -- see known issue 1 in sim/README.md, which is why this
-  # is not large enough to reach the 14 m first waypoint.
+  # both axes, and the planner reads the same extents back through
+  # MapQuery::bounds(). The map is never recentred though -- see known issue 1
+  # in sim/README.md, which is why this is not large enough to reach the 14 m
+  # first waypoint.
   x: 20.0
   y: 20.0
   resolution: 0.10
   min_grid_points: 3
   pos_obstacle_threshold: 0.25
   neg_obstacle_threshold: -0.25
+  # Cells the depth camera has never seen. false lets the planner route through
+  # them, which is what the old map did by accident -- it initialised elevation
+  # to 0.0, so unobserved ground read as flat. With one forward-facing D435i,
+  # true refuses most goals until coverage improves. Team call, not a default
+  # to flip casually.
+  unknown_is_occupied: false
 
 filters:
   min_filtering_points: 100
@@ -34,4 +42,13 @@ filters:
     z: 0.05
 
 planner:
+  # Only the sampling planner (OmplPlanner) spends this; A* is not timed.
   time_to_solve: 1.0
+  # METRES from the path to the nearest obstacle. Was effectively a count of
+  # grid cells before, so check this one against the rover's real footprint.
+  safety_margin: 0.35
+  goal_tolerance: 0.15
+  # How hard to push the path away from obstacles once it already clears them
+  # by safety_margin. 0 gives the shortest route regardless of how close it
+  # shaves; higher hugs the middle of the gap.
+  obstacle_cost_weight: 2.0

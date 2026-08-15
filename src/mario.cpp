@@ -13,14 +13,10 @@
 #include <librealsense2/rs.hpp>
 #include <memory>
 #include <mutex>
-#include <ompl/base/Path.h>
-#include <ompl/base/ScopedState.h>
-#include <ompl/base/spaces/RealVectorBounds.h>
-#include <ompl/base/spaces/RealVectorStateSpace.h>
-#include <ompl/geometric/PathGeometric.h>
 #include <opencv2/aruco.hpp>
 #include <opencv2/core/check.hpp>
 #include <opencv2/opencv.hpp>
+#include <optional>
 #include <pcl/common/transforms.h>
 #include <pcl/impl/point_types.hpp>
 #include <pcl/pcl_macros.h>
@@ -41,7 +37,8 @@
 #include <zmq_addon.hpp>
 
 #include "fsm.hpp"
-#include "nav.hpp"
+#include "nav/occupancy_map.hpp"
+#include "nav/planner_astar.hpp"
 #include "pid.hpp"
 #include "serial.hpp"
 #include "slam.hpp"
@@ -202,7 +199,7 @@ auto localize(struct slam::slamHandle *slam_handler,
 }
 
 /* function to create gridmap  */
-auto mapping(nav::navContext *nav_ctx,
+auto mapping(nav::OccupancyMap &occupancy_map,
              utils::SharedLatest<struct slam::slamPose> &poseState,
              zmq::socket_t &sub, const rerun::RecordingStream &rec,
              utils::rs_config realsense_config) -> void {
@@ -213,7 +210,9 @@ auto mapping(nav::navContext *nav_ctx,
   std::vector<float> points_buffer;
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(
       new pcl::PointCloud<pcl::PointXYZ>());
-  Eigen::Affine3d T_pc;
+  /* Identity, not default-constructed: an Affine3d leaves its bottom row
+     uninitialised, and transformPointCloud reads the whole 4x4. */
+  Eigen::Affine3d T_pc = Eigen::Affine3d::Identity();
 
   while (true) {
 
@@ -229,17 +228,15 @@ auto mapping(nav::navContext *nav_ctx,
     std::memcpy(points_buffer.data(), pointcloud_msg[1].data(),
                 pointcloud_msg[1].size());
 
-    int buffer_size = static_cast<int>(points_buffer.size() / 3);
-
-    cloud->width = buffer_size;
+    const size_t num_points = points_buffer.size() / 3;
+    cloud->width = static_cast<uint32_t>(num_points);
     cloud->height = 1;
     cloud->is_dense = false;
-    cloud->points.resize(buffer_size);
-
-    for (int i = 0; i < buffer_size; i++) {
-      cloud->points[i].x = points_buffer[i * 3];
-      cloud->points[i].y = points_buffer[i * 3 + 1];
-      cloud->points[i].z = points_buffer[i * 3 + 2];
+    cloud->points.resize(num_points);
+    for (size_t i = 0; i < num_points; ++i) {
+      cloud->points[i].x = points_buffer[3 * i + 0];
+      cloud->points[i].y = points_buffer[3 * i + 1];
+      cloud->points[i].z = points_buffer[3 * i + 2];
     }
 
     if (!poseState.get(pose)) {
@@ -258,13 +255,17 @@ auto mapping(nav::navContext *nav_ctx,
     T_pc.linear() = R_yaw * utils::T_camera_base.block<3, 3>(0, 0);
     T_pc.translation() = Eigen::Vector3d(pose.x, pose.y, pose.z);
 
-    nav::preProcessPointCloud(nav_ctx, cloud, T_pc.matrix());
-    nav::processGridMapCells(nav_ctx, cloud);
-    nav::log_gridmap(nav_ctx, rec);
+    occupancy_map.integrate(cloud, T_pc.matrix());
+    occupancy_map.log(rec);
 
-    std::lock_guard<std::mutex> lock(map_sync.mtx);
-    map_sync.flag = true;
-    map_sync.cv.notify_all();
+    /* Only the first grid is a milestone -- the FSM waits on it once before
+       leaving BOOT. Signalling every iteration would be harmless but taking
+       the lock every frame is not. */
+    if (!map_sync.flag) {
+      std::lock_guard<std::mutex> lock(map_sync.mtx);
+      map_sync.flag = true;
+      map_sync.cv.notify_all();
+    }
   }
 }
 
@@ -303,7 +304,7 @@ private:
         utils::normalize_angle(target_angle_global - rover_angle_global);
 
     double local_goal_dist =
-        std::min(total_distance, (double)nav_ctx->params.grid_map_dim[1]);
+        std::min(total_distance, (double)map_.params().dim[1]);
 
     double target_x = local_goal_dist * std::cos(relative_angle);
     double target_y = local_goal_dist * std::sin(relative_angle);
@@ -380,23 +381,25 @@ public:
   }
 
   auto traverse() -> TraverseResult {
-    auto geo_path =
-        std::dynamic_pointer_cast<ompl::geometric::PathGeometric>(current_path);
-    if (!geo_path || geo_path->getStateCount() == 0) {
+    if (!current_path || current_path->empty()) {
       spdlog::warn("State Machine: Path is empty or invalid");
       return TraverseResult::REACHED;
     }
-    const auto states = geo_path->getStates();
+    const nav::Path &path = *current_path;
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
     uint64_t previous = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
-    int state_idx = 1;
-    double linear_x = drive_cmd.linear_x, angular_z = drive_cmd.angular_z;
+    size_t waypoint_idx = 1;
+    double linear_x = drive_cmd.linear_x, angular_z = 0.0;
+    /* The configured maximum, held separately. Clamping against angular_z
+       itself uses the previous output as this iteration's bound, which
+       ratchets the command down to zero over a few waypoints. */
+    const double max_angular = drive_cmd.angular_z;
 
-    while (state_idx < (int)states.size()) {
+    while (waypoint_idx < path.size()) {
       if (std::chrono::steady_clock::now() > deadline)
         return TraverseResult::REPLAN_TIMEOUT;
 
@@ -414,27 +417,17 @@ public:
          here instead — otherwise this spins and floods the serial port */
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-      grid_map::Position gm_pos(pose.x, pose.y);
-      grid_map::Index gm_idx;
-      if (nav_ctx->map->getIndex(gm_pos, gm_idx)) {
-        for (auto &obs : nav_ctx->occupancy_list) {
-          double d = std::sqrt(std::pow(gm_idx(0) - obs(0), 2) +
-                               std::pow(gm_idx(1) - obs(1), 2));
-          if (d < 3.0)
-            return TraverseResult::REPLAN_OBSTACLE;
-        }
-      }
+      /* Same three-cell trip wire as before, asked in metres now that the
+         map answers in them. */
+      if (map_.clearance(pose.x, pose.y) < 3.0 * map_.resolution())
+        return TraverseResult::REPLAN_OBSTACLE;
 
-      auto state = states[state_idx]->as<ob::RealVectorStateSpace::StateType>();
-      double target_x = state->values[0];
-      double target_y = state->values[1];
-
-      double dx = target_x - pose.x;
-      double dy = target_y - pose.y;
+      double dx = path[waypoint_idx].x - pose.x;
+      double dy = path[waypoint_idx].y - pose.y;
       double distance = std::sqrt(dx * dx + dy * dy);
 
-      if (distance < nav_ctx->params.grid_map_res) {
-        state_idx++;
+      if (distance < map_.resolution()) {
+        waypoint_idx++;
         continue;
       }
 
@@ -450,7 +443,7 @@ public:
       else
         angular_z = std::clamp(
             control::computeCommand(pid_ctx, angular_error, now - previous),
-            (angular_z * -1), angular_z);
+            -max_angular, max_angular);
       previous = now;
 
       tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(linear_x, angular_z);
@@ -458,7 +451,12 @@ public:
           serial, msg, tarzan::TARZAN_MSG_LEN);
       if (err != serial::Error::WriteSuccess)
         return TraverseResult::FAULT_SERIAL;
+      spdlog::debug("State Machine: writing drive cmd");
     }
+
+    /* The last twist written is still in effect, so stop before handing the
+       FSM back -- otherwise the rover coasts through the replan. */
+    stop_motors();
     return TraverseResult::REACHED;
   }
 
@@ -632,30 +630,25 @@ public:
     auto [local_x, local_y] = get_local_goal(geo_msg.geo_data, target_latitude,
                                              target_longitude, pose);
 
-    ob::ScopedState<> start(nav_ctx->space);
-    start->as<ob::RealVectorStateSpace::StateType>()->values[0] = pose.x;
-    start->as<ob::RealVectorStateSpace::StateType>()->values[1] = pose.y;
-
-    ob::ScopedState<> goal(nav_ctx->space);
-    goal->as<ob::RealVectorStateSpace::StateType>()->values[0] = local_x;
-    goal->as<ob::RealVectorStateSpace::StateType>()->values[1] = local_y;
-
-    current_path = nav::get_path(nav_ctx, start, goal);
-    if (!current_path) {
-      spdlog::error("plan: planner failed");
+    auto path = planner_.plan({pose.x, pose.y}, {local_x, local_y});
+    if (!path) {
+      spdlog::warn("State Machine: no path to local goal");
       return PlanResult::FAULT;
     }
+
+    current_path = std::move(path);
     return PlanResult::PATH_FOUND;
   }
 
 public:
-  struct nav::navContext *nav_ctx;
+  nav::OccupancyMap &map_;
+  nav::Planner &planner_;
   struct control::Pid *pid_ctx;
   boost::asio::serial_port *serial;
   utils::SharedLatest<struct slam::slamPose> &poseState;
   tarzan::DiffDriveTwist drive_cmd;
   slam::slamHandle *slam_handler;
-  ob::PathPtr current_path;
+  std::optional<nav::Path> current_path;
   std::queue<Waypoint> waypoints;
   zmq::socket_t &color_sub;
   const rerun::RecordingStream &rec;
@@ -666,15 +659,15 @@ public:
   State current_state = State::BOOT;
   Waypoint current_waypoint{};
 
-  StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
-               boost::asio::serial_port *ser,
+  StateMachine(nav::OccupancyMap &map, nav::Planner &planner,
+               struct control::Pid *pid, boost::asio::serial_port *ser,
                utils::SharedLatest<struct slam::slamPose> &pose_state,
                tarzan::DiffDriveTwist cmd, slam::slamHandle *sh,
                zmq::socket_t &csub, const rerun::RecordingStream &r,
                YOLO8Detector *det)
-      : nav_ctx(nav), pid_ctx(pid), serial(ser), poseState(pose_state),
-        drive_cmd(cmd), slam_handler(sh), color_sub(csub), rec(r),
-        detector(det) {};
+      : map_(map), planner_(planner), pid_ctx(pid), serial(ser),
+        poseState(pose_state), drive_cmd(cmd), slam_handler(sh),
+        color_sub(csub), rec(r), detector(det) {};
 
   /* The graph itself is in include/fsm.hpp, shared with test/fsm_test.cpp. */
   auto run() -> int { return fsm::run(*this); }
@@ -756,9 +749,14 @@ int main(int argc, char *argv[]) {
       vm["slam_config"].as<std::string>(), vm["slam_vocab"].as<std::string>());
   utils::SharedLatest<struct slam::slamPose> poseState;
 
-  /* path planning vars */
-  struct nav::navContext *nav_ctx =
-      nav::setupNav(vm["gridmap_config"].as<std::string>());
+  /* mapping & path planning vars */
+  const std::string nav_cfg = vm["gridmap_config"].as<std::string>();
+  nav::MapParams map_params = nav::loadMapParams(nav_cfg);
+  nav::PlannerParams planner_params = nav::loadPlannerParams(nav_cfg);
+
+  nav::OccupancyMap occupancy_map(map_params);
+  std::unique_ptr<nav::Planner> planner =
+      std::make_unique<nav::AStarPlanner>(occupancy_map, planner_params);
 
   /* rerun vars */
   const auto rec = rerun::RecordingStream("TEAM RUDRA AUTONOMOUS - mario");
@@ -806,7 +804,7 @@ int main(int argc, char *argv[]) {
   }
   spdlog::info(std::format("Successful connection to {}", SERIAL_PORT));
 
-  StateMachine sm(nav_ctx, pid_ctx, serial, poseState,
+  StateMachine sm(occupancy_map, *planner, pid_ctx, serial, poseState,
                   tarzan::DiffDriveTwist{vm["linear"].as<float>(),
                                          vm["angular"].as<float>()},
                   slam_handler, color_sub, rec, detector);
@@ -857,9 +855,9 @@ int main(int argc, char *argv[]) {
   std::thread localize_thread(localize, slam_handler, std::ref(poseState),
                               std::ref(slam_sub), std::ref(rec),
                               realsense_config);
-  std::thread mapping_thread(mapping, nav_ctx, std::ref(poseState),
-                             std::ref(mapping_sub), std::ref(rec),
-                             realsense_config);
+  std::thread mapping_thread(mapping, std::ref(occupancy_map),
+                             std::ref(poseState), std::ref(mapping_sub),
+                             std::ref(rec), realsense_config);
 
   /* PARSE GNSS WAYPOINTS */
   {
@@ -902,7 +900,6 @@ int main(int argc, char *argv[]) {
   mapping_thread.join();
 
   delete slam_handler;
-  delete nav_ctx;
   delete pid_ctx;
   delete detector;
   if (rs_ptr)

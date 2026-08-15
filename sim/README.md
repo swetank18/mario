@@ -146,18 +146,21 @@ of the marker, for checking detection without driving the whole mission.
 ## Known issues in the surrounding code
 
 These are pre-existing and were found while wiring the sim up. The first one
-blocks the sim outright.
+still limits how far the rover can get.
 
-1. **The grid map never follows the rover** (`src/nav.cpp:41`). `setGeometry`
-   builds a fixed `grid_map_dim` box centred on the SLAM origin and nothing
-   ever calls `GridMap::move()`, but `plan()` works in absolute SLAM
+1. **The grid map never follows the rover** (`src/nav/occupancy_map.cpp`).
+   `setGeometry` builds a fixed `dim` box centred on the SLAM origin and
+   nothing ever calls `GridMap::move()`, but `plan()` works in absolute SLAM
    coordinates — `start` is `pose.x, pose.y` and the goal is that pose plus an
-   offset. As soon as the rover is further than `x/2` (10 m with
-   `config/gridmap_sim.yaml`) from where SLAM started, both states fall outside
-   the planner's state space and every `plan()` fails. Waypoint 1 is 14 m out,
-   so this stops the mission at the first leg. Fixing it means recentring the
-   map on the current pose as it updates and resetting the OMPL bounds around
-   the map's new centre on each `plan()`, rather than once in `setupNav`.
+   offset. Once the rover is further than `x/2` (10 m with
+   `config/gridmap_sim.yaml`) from where SLAM started, it drives off its own
+   map. `AStarPlanner` now clamps an off-map goal back onto the grid instead of
+   failing outright, so the mission no longer stops dead at the first leg — but
+   the rover is still planning inside a box it has left, and waypoint 1 is
+   14 m out. The fix is entirely on the mapping side now: recentre the map on
+   the current pose as it updates. Planners read their bounds back through
+   `MapQuery::bounds()` on every call, so nothing on the planning side needs
+   to know.
 
 2. **No YOLO model in the tree.** `--yolo_model` has no default and
    `model/` contains only `labels.names` (`right`, `left`, `cone`). Without a

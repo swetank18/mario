@@ -34,7 +34,6 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
-#include <taskflow/taskflow.hpp>
 #include <thread>
 #include <tuple>
 #include <unordered_set>
@@ -716,6 +715,17 @@ int main(int argc, char *argv[]) {
   if (vm.count("help")) {
     std::cout << desc << "\n";
     return 1;
+  }
+
+  /* Everything below reads these with vm[...].as<>(), which throws on a
+     missing option rather than telling you which one you forgot. */
+  for (const char *opt :
+       {"serial", "br", "rerun_ip", "gridmap_config", "p", "i", "d", "gnss",
+        "linear", "angular", "yolo_model", "yolo_labels"}) {
+    if (!vm.count(opt)) {
+      spdlog::error("Missing required option: --{}", opt);
+      return -1;
+    }
   }
 
   /* In sim the Webots mario_bridge controller owns the PUB socket, so frames

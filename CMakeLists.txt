@@ -72,6 +72,9 @@ target_include_directories(pid PUBLIC include)
 
 option(BUILD_TESTS "Build Test Scipts" ON)
 if(BUILD_TESTS)
+  enable_testing()
+  find_package(Threads REQUIRED)
+
   # tarzan test
   add_executable(serial_test src/serial.cpp)
   target_compile_definitions(serial_test PRIVATE SERIAL_TEST_CPP=1)
@@ -94,6 +97,15 @@ if(BUILD_TESTS)
   target_compile_definitions(pid_test PRIVATE PID_TEST_CPP=1)
   target_include_directories(pid_test PRIVATE pid slam serial)
   target_link_libraries(pid_test PRIVATE pid slam serial)
+
+  # fsm test -- drives include/fsm.hpp, the same transition graph mario.cpp
+  # runs, with scripted action results. Deliberately depends on nothing but
+  # taskflow, so the state machine can be tested without stella_vslam, OMPL,
+  # grid_map, rerun or a RealSense attached.
+  add_executable(fsm_test test/fsm_test.cpp)
+  target_include_directories(fsm_test PRIVATE include)
+  target_link_libraries(fsm_test PRIVATE Threads::Threads)
+  add_test(NAME fsm COMMAND fsm_test)
 
   # aruco test -- src/aruco.cpp is not in the tree, so only wire this up if it
   # reappears. Referencing it unconditionally fails the configure step.

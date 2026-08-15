@@ -148,34 +148,30 @@ of the marker, for checking detection without driving the whole mission.
 These are pre-existing and were found while wiring the sim up. The first one
 blocks the sim outright.
 
-1. **`serial::asyncRead` does not wait for the read to complete**
-   (`src/serial.cpp:76`). It issues `boost::asio::async_read` and returns
-   immediately, so `read_msg` COBS-decodes a buffer that has not been filled
-   yet. Worse, `read_buffer` is a stack array inside `read_msg`, so the
-   completion handler writes into a stack frame that has already been
-   destroyed. `plan()` therefore reads garbage lat/lon and the FSM cannot
-   reach any waypoint. Needs a blocking `boost::asio::read` (or a proper
-   wait on the handler) before the sim can drive the mission.
+1. **The grid map never follows the rover** (`src/nav.cpp:41`). `setGeometry`
+   builds a fixed `grid_map_dim` box centred on the SLAM origin and nothing
+   ever calls `GridMap::move()`, but `plan()` works in absolute SLAM
+   coordinates — `start` is `pose.x, pose.y` and the goal is that pose plus an
+   offset. As soon as the rover is further than `x/2` (10 m with
+   `config/gridmap_sim.yaml`) from where SLAM started, both states fall outside
+   the planner's state space and every `plan()` fails. Waypoint 1 is 14 m out,
+   so this stops the mission at the first leg. Fixing it means recentring the
+   map on the current pose as it updates and resetting the OMPL bounds around
+   the map's new centre on each `plan()`, rather than once in `setupNav`.
 
-2. **`setupNav` bounds do not match the grid map's centring**
-   (`src/nav.cpp:44` vs `:52`). `setGeometry` centres the map on the origin,
-   spanning `[-x/2, +x/2]`, but the OMPL bounds are set to `[0, x]`. Any
-   negative SLAM coordinate is then outside the planner's state space, so
-   `plan()` fails for roughly three quadrants of the map.
-
-3. **No YOLO model in the tree.** `--yolo_model` has no default and
+2. **No YOLO model in the tree.** `--yolo_model` has no default and
    `model/` contains only `labels.names` (`right`, `left`, `cone`). Without a
    model the `GPS_OBJECT` waypoint just runs out its 60 s search timeout and
    takes the partial-credit path to `WAYPOINT_REACHED` — still a valid FSM
    path, just not a detection test.
 
-4. **`localize()` assumes strict message ordering** (`src/mario.cpp:156`).
+3. **`localize()` assumes strict message ordering** (`src/mario.cpp:156`).
    It does three positional `recv_multipart` calls and treats them as colour,
    depth, timestamp. A single dropped message desynchronises the stream
    permanently. The bridge publishes in the right order and caps its send
    high-water mark at 4 to limit the blast radius, but the assumption is
    fragile.
 
-5. **GNSS parser has no comment support** (`src/mario.cpp:1097`). The `#`
+4. **GNSS parser has no comment support** (`src/mario.cpp:1097`). The `#`
    lines in `config/gnss_waypoints.txt` each log a "Skipping malformed GNSS
    line" warning. Harmless, but noisy.

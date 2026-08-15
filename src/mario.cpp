@@ -41,6 +41,7 @@
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 
+#include "fsm.hpp"
 #include "nav.hpp"
 #include "pid.hpp"
 #include "serial.hpp"
@@ -268,48 +269,24 @@ auto mapping(nav::navContext *nav_ctx,
   }
 }
 
+/* The transition graph lives in include/fsm.hpp so that test/fsm_test.cpp can
+   drive the same table with scripted results. This class supplies the actions
+   that graph calls -- everything below is the rover-side implementation. */
 class StateMachine {
 public:
-  enum class State {
-    BOOT,
-    WAIT_MAP_READY,
-    LOAD_WAYPOINT,
-    PLAN_PATH,
-    TRAVERSE_PATH,
-    SEARCH_TARGET,
-    APPROACH_TARGET,
-    WAYPOINT_REACHED,
-    RECOVER_SLAM,
-    RECOVER_OBSTACLE,
-    FAULT_SERIAL,
-    MISSION_DONE,
-    MISSION_ABORT
-  };
-
-  enum class TraverseResult {
-    REACHED,
-    REPLAN_TIMEOUT,
-    REPLAN_OBSTACLE,
-    FAULT_SLAM,
-    FAULT_SERIAL
-  };
-
-  enum class PlanResult { PATH_FOUND, AT_GOAL, FAULT };
-
-  enum class ApproachResult { ARRIVED, LOST_TARGET, FAULT_SERIAL };
-
-  enum class WaypointType { GPS_ONLY, GPS_ARUCO, GPS_OBJECT };
-
-  enum class LedColor { RED, BLUE, GREEN };
-
-  struct Waypoint {
-    double lat = 0.0;
-    double lon = 0.0;
-    WaypointType type = WaypointType::GPS_ONLY;
-    int aruco_id = -1;
-  };
+  using State = fsm::State;
+  using TraverseResult = fsm::TraverseResult;
+  using PlanResult = fsm::PlanResult;
+  using ApproachResult = fsm::ApproachResult;
+  using WaypointType = fsm::WaypointType;
+  using LedColor = fsm::LedColor;
+  using Waypoint = fsm::Waypoint;
 
 private:
+  static constexpr auto state_name(State s) -> const char * {
+    return fsm::state_name(s);
+  }
+
   auto get_local_goal(struct tarzan::geodetic &current_gps,
                       double target_latitude, double target_longitude,
                       slam::slamPose &pose) -> std::tuple<float, float> {
@@ -338,30 +315,55 @@ private:
     return std::make_tuple(local_goal_x, local_goal_y);
   }
 
-  static auto state_name(State s) -> const char * {
-    switch (s) {
-    case State::BOOT: return "BOOT";
-    case State::WAIT_MAP_READY: return "WAIT_MAP_READY";
-    case State::LOAD_WAYPOINT: return "LOAD_WAYPOINT";
-    case State::PLAN_PATH: return "PLAN_PATH";
-    case State::TRAVERSE_PATH: return "TRAVERSE_PATH";
-    case State::SEARCH_TARGET: return "SEARCH_TARGET";
-    case State::APPROACH_TARGET: return "APPROACH_TARGET";
-    case State::WAYPOINT_REACHED: return "WAYPOINT_REACHED";
-    case State::RECOVER_SLAM: return "RECOVER_SLAM";
-    case State::RECOVER_OBSTACLE: return "RECOVER_OBSTACLE";
-    case State::FAULT_SERIAL: return "FAULT_SERIAL";
-    case State::MISSION_DONE: return "MISSION_DONE";
-    case State::MISSION_ABORT: return "MISSION_ABORT";
-    }
-    return "?";
-  }
+public:
+  /* ---- the actions fsm::run() calls ---------------------------------- */
 
-  auto log_transition(State from, State to) -> void {
+  auto on_transition(State from, State to) -> void {
     if (from != to)
       spdlog::info(
           std::format("State: {} -> {}", state_name(from), state_name(to)));
     current_state = to;
+  }
+
+  auto wait_map_ready() -> void {
+    std::unique_lock<std::mutex> lock(map_sync.mtx);
+    map_sync.cv.wait(lock, [] { return map_sync.flag; });
+  }
+
+  auto load_waypoint() -> bool {
+    if (waypoints.empty())
+      return false;
+    current_waypoint = waypoints.front();
+    waypoints.pop();
+    spdlog::info(std::format("Waypoint: lat={} lon={} type={}",
+                             current_waypoint.lat, current_waypoint.lon,
+                             (int)current_waypoint.type));
+    return true;
+  }
+
+  auto current_waypoint_type() -> WaypointType { return current_waypoint.type; }
+
+  /* One scan step: nudge the rover round and report whether the link held. */
+  auto search_scan_step() -> bool {
+    tarzan::tarzan_msg msg =
+        tarzan::get_tarzan_msg(0.0, drive_cmd.angular_z * 0.3);
+    return serial::write_msg<struct tarzan::tarzan_msg>(
+               serial, msg, tarzan::TARZAN_MSG_LEN) ==
+           serial::Error::WriteSuccess;
+  }
+
+  auto slam_tracking() -> bool {
+    return slam::getStatus(slam_handler) == "Tracking";
+  }
+
+  auto clear_path() -> void { current_path.reset(); }
+
+  auto on_mission_done() -> void {
+    spdlog::info("State Machine: mission complete");
+  }
+
+  auto on_mission_abort(State in) -> void {
+    spdlog::error(std::format("State Machine: aborted in {}", state_name(in)));
   }
 
   auto stop_motors() -> void {
@@ -660,11 +662,10 @@ public:
   const rerun::RecordingStream &rec;
   YOLO8Detector *detector;
 
+  /* Retry counts and search deadlines are fsm::run()'s bookkeeping now; this
+     only tracks the current state so aborts can name where they happened. */
   State current_state = State::BOOT;
   Waypoint current_waypoint{};
-  std::chrono::steady_clock::time_point search_started_at{};
-  bool search_active = false;
-  int serial_retry_count = 0;
 
   StateMachine(struct nav::navContext *nav, struct control::Pid *pid,
                boost::asio::serial_port *ser,
@@ -676,241 +677,8 @@ public:
         drive_cmd(cmd), slam_handler(sh), color_sub(csub), rec(r),
         detector(det) {};
 
-  auto run() -> int {
-    tf::Executor executor(1);
-    tf::Taskflow taskflow;
-
-    signal_led(LedColor::RED);
-    current_state = State::BOOT;
-
-    auto t_boot = taskflow.emplace([this]() -> int {
-                            log_transition(current_state, State::WAIT_MAP_READY);
-                            return 0;
-                          })
-                      .name("BOOT");
-
-    auto t_wait_map = taskflow.emplace([this]() -> int {
-                                std::unique_lock<std::mutex> lock(map_sync.mtx);
-                                map_sync.cv.wait(
-                                    lock, [] { return map_sync.flag; });
-                                log_transition(current_state,
-                                               State::LOAD_WAYPOINT);
-                                return 0;
-                              })
-                          .name("WAIT_MAP_READY");
-
-    auto t_load_wp = taskflow.emplace([this]() -> int {
-                               if (waypoints.empty()) {
-                                 log_transition(current_state,
-                                                State::MISSION_DONE);
-                                 return 0;
-                               }
-                               current_waypoint = waypoints.front();
-                               waypoints.pop();
-                               spdlog::info(std::format(
-                                   "Waypoint: lat={} lon={} type={}",
-                                   current_waypoint.lat, current_waypoint.lon,
-                                   (int)current_waypoint.type));
-                               log_transition(current_state, State::PLAN_PATH);
-                               return 1;
-                             })
-                         .name("LOAD_WAYPOINT");
-
-    auto t_plan_path = taskflow.emplace([this]() -> int {
-                                 PlanResult pr = plan();
-                                 if (pr == PlanResult::PATH_FOUND) {
-                                   serial_retry_count = 0;
-                                   log_transition(current_state,
-                                                  State::TRAVERSE_PATH);
-                                   return 0;
-                                 }
-                                 if (pr == PlanResult::FAULT) {
-                                   log_transition(current_state,
-                                                  State::FAULT_SERIAL);
-                                   return 3;
-                                 }
-                                 if (current_waypoint.type ==
-                                     WaypointType::GPS_ONLY) {
-                                   log_transition(current_state,
-                                                  State::WAYPOINT_REACHED);
-                                   return 1;
-                                 }
-                                 log_transition(current_state,
-                                                State::SEARCH_TARGET);
-                                 return 2;
-                               })
-                           .name("PLAN_PATH");
-
-    auto t_traverse_path =
-        taskflow.emplace([this]() -> int {
-                  TraverseResult tr = traverse();
-                  switch (tr) {
-                  case TraverseResult::REACHED:
-                  case TraverseResult::REPLAN_TIMEOUT:
-                    log_transition(current_state, State::PLAN_PATH);
-                    return 0;
-                  case TraverseResult::REPLAN_OBSTACLE:
-                    log_transition(current_state, State::RECOVER_OBSTACLE);
-                    return 1;
-                  case TraverseResult::FAULT_SLAM:
-                    log_transition(current_state, State::RECOVER_SLAM);
-                    return 2;
-                  case TraverseResult::FAULT_SERIAL:
-                    log_transition(current_state, State::FAULT_SERIAL);
-                    return 3;
-                  }
-                  return 0;
-                })
-            .name("TRAVERSE_PATH");
-
-    auto t_search = taskflow.emplace([this]() -> int {
-                              if (!search_active) {
-                                search_started_at =
-                                    std::chrono::steady_clock::now();
-                                search_active = true;
-                              }
-                              if (std::chrono::steady_clock::now() -
-                                      search_started_at >
-                                  std::chrono::seconds(60)) {
-                                search_active = false;
-                                spdlog::warn(
-                                    "Search: timeout, claiming partial credit");
-                                log_transition(current_state,
-                                               State::WAYPOINT_REACHED);
-                                return 1;
-                              }
-                              bool found =
-                                  current_waypoint.type ==
-                                          WaypointType::GPS_ARUCO
-                                      ? search_aruco()
-                                      : search_object();
-                              if (found) {
-                                search_active = false;
-                                log_transition(current_state,
-                                               State::APPROACH_TARGET);
-                                return 0;
-                              }
-                              tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(
-                                  0.0, drive_cmd.angular_z * 0.3);
-                              serial::Error err = serial::write_msg<
-                                  struct tarzan::tarzan_msg>(
-                                  serial, msg, tarzan::TARZAN_MSG_LEN);
-                              if (err != serial::Error::WriteSuccess) {
-                                log_transition(current_state,
-                                               State::FAULT_SERIAL);
-                                return 3;
-                              }
-                              return 2;
-                            })
-                        .name("SEARCH_TARGET");
-
-    auto t_approach = taskflow.emplace([this]() -> int {
-                                ApproachResult ar = approach();
-                                if (ar == ApproachResult::ARRIVED) {
-                                  log_transition(current_state,
-                                                 State::WAYPOINT_REACHED);
-                                  return 0;
-                                }
-                                if (ar == ApproachResult::LOST_TARGET) {
-                                  log_transition(current_state,
-                                                 State::SEARCH_TARGET);
-                                  return 1;
-                                }
-                                log_transition(current_state,
-                                               State::FAULT_SERIAL);
-                                return 2;
-                              })
-                          .name("APPROACH_TARGET");
-
-    auto t_wp_reached = taskflow.emplace([this]() -> int {
-                                  stop_motors();
-                                  signal_led(LedColor::GREEN);
-                                  std::this_thread::sleep_for(
-                                      std::chrono::seconds(2));
-                                  log_transition(current_state,
-                                                 State::LOAD_WAYPOINT);
-                                  return 0;
-                                })
-                            .name("WAYPOINT_REACHED");
-
-    auto t_recover_slam =
-        taskflow.emplace([this]() -> int {
-                  stop_motors();
-                  auto deadline = std::chrono::steady_clock::now() +
-                                  std::chrono::seconds(10);
-                  while (std::chrono::steady_clock::now() < deadline) {
-                    if (slam::getStatus(slam_handler) == "Tracking") {
-                      log_transition(current_state, State::PLAN_PATH);
-                      return 0;
-                    }
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(200));
-                  }
-                  log_transition(current_state, State::MISSION_ABORT);
-                  return 1;
-                })
-            .name("RECOVER_SLAM");
-
-    auto t_recover_obs = taskflow.emplace([this]() -> int {
-                                   stop_motors();
-                                   current_path.reset();
-                                   std::this_thread::sleep_for(
-                                       std::chrono::milliseconds(500));
-                                   log_transition(current_state,
-                                                  State::PLAN_PATH);
-                                   return 0;
-                                 })
-                             .name("RECOVER_OBSTACLE");
-
-    auto t_fault_serial = taskflow.emplace([this]() -> int {
-                                    stop_motors();
-                                    if (++serial_retry_count > 5) {
-                                      log_transition(current_state,
-                                                     State::MISSION_ABORT);
-                                      return 1;
-                                    }
-                                    std::this_thread::sleep_for(
-                                        std::chrono::seconds(1));
-                                    log_transition(current_state,
-                                                   State::PLAN_PATH);
-                                    return 0;
-                                  })
-                              .name("FAULT_SERIAL");
-
-    auto t_mission_done = taskflow.emplace([this]() -> void {
-                                    signal_led(LedColor::GREEN);
-                                    spdlog::info(
-                                        "State Machine: mission complete");
-                                  })
-                              .name("MISSION_DONE");
-
-    auto t_mission_abort = taskflow.emplace([this]() -> void {
-                                     stop_motors();
-                                     signal_led(LedColor::RED);
-                                     spdlog::error(std::format(
-                                         "State Machine: aborted in {}",
-                                         state_name(current_state)));
-                                   })
-                               .name("MISSION_ABORT");
-
-    t_boot.precede(t_wait_map);
-    t_wait_map.precede(t_load_wp);
-    t_load_wp.precede(t_mission_done, t_plan_path);
-    t_plan_path.precede(t_traverse_path, t_wp_reached, t_search,
-                        t_fault_serial);
-    t_traverse_path.precede(t_plan_path, t_recover_obs, t_recover_slam,
-                            t_fault_serial);
-    t_search.precede(t_approach, t_wp_reached, t_search, t_fault_serial);
-    t_approach.precede(t_wp_reached, t_search, t_fault_serial);
-    t_wp_reached.precede(t_load_wp);
-    t_recover_slam.precede(t_plan_path, t_mission_abort);
-    t_recover_obs.precede(t_plan_path);
-    t_fault_serial.precede(t_plan_path, t_mission_abort);
-
-    executor.run(taskflow).wait();
-
-    return current_state == State::MISSION_DONE ? 1 : 0;
-  }
+  /* The graph itself is in include/fsm.hpp, shared with test/fsm_test.cpp. */
+  auto run() -> int { return fsm::run(*this); }
 };
 
 int main(int argc, char *argv[]) {

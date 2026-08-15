@@ -4,8 +4,9 @@
 
 grid_map:
   # setGeometry() centres the map on the origin, so this spans [-10, 10] on
-  # both axes. See the note in sim/README.md about setupNav() giving OMPL
-  # bounds of [0, x] instead, which does not match this centring.
+  # both axes, and setupNav() gives OMPL matching bounds. The map is never
+  # recentred though -- see known issue 1 in sim/README.md, which is why this
+  # is not large enough to reach the 14 m first waypoint.
   x: 20.0
   y: 20.0
   resolution: 0.10

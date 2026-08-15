@@ -14,3 +14,9 @@ sim/tools/bridge_check
 # github.com/stella-cv/FBoW_orb_vocab)
 orb_vocab.fbow
 sim/worlds/.*.wbproj
+
+# recorded sim runs
+fsm_run.mp4
+fsm_run.log
+*.mp4
+sim/tools/fsm_drive

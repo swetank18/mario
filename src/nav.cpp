@@ -47,12 +47,16 @@ struct navContext *setupNav(std::string config_file) {
   nav->space = std::make_shared<ob::RealVectorStateSpace>(2);
 
   ob::RealVectorBounds bounds(2);
+  // setGeometry above centres the map on the origin, so it spans [-dim/2,
+  // +dim/2] on each axis and ValidityChecker::clearance looks cells up in
+  // those same coordinates. The planner has to cover the same range, or every
+  // negative coordinate is outside the state space and plan() fails.
   // x-bounds
-  bounds.setLow(0, 0);
-  bounds.setHigh(0, nav->params.grid_map_dim[0]);
+  bounds.setLow(0, -nav->params.grid_map_dim[0] / 2.0);
+  bounds.setHigh(0, nav->params.grid_map_dim[0] / 2.0);
   // y-bounds
-  bounds.setLow(1, 0);
-  bounds.setHigh(1, nav->params.grid_map_dim[1]);
+  bounds.setLow(1, -nav->params.grid_map_dim[1] / 2.0);
+  bounds.setHigh(1, nav->params.grid_map_dim[1] / 2.0);
   // set bounds to state
   nav->space->as<ob::RealVectorStateSpace>()->setBounds(bounds);
 

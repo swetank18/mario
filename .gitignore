@@ -3,3 +3,20 @@ build
 .cache
 .envrc
 *.onnx
+
+# Webots sim build artefacts
+sim/controllers/*/build/
+sim/controllers/*/*.d
+sim/controllers/mario_bridge/mario_bridge
+sim/tools/bridge_check
+
+# stella_vslam ORB vocabulary (43 MB, fetched from
+# github.com/stella-cv/FBoW_orb_vocab)
+orb_vocab.fbow
+sim/worlds/.*.wbproj
+
+# recorded sim runs
+fsm_run.mp4
+fsm_run.log
+*.mp4
+sim/tools/fsm_drive

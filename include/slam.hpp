@@ -1,6 +1,7 @@
 #ifndef SLAM_HPP
 #define SLAM_HPP
 
+#include "utils.hpp"
 #include <Eigen/Dense>
 #include <librealsense2/rs.hpp>
 #include <opencv2/highgui.hpp>
@@ -16,9 +17,13 @@ struct slamHandle {
   std::shared_ptr<stella_vslam::config> slam_cfg;
   stella_vslam::system slam;
 
-  slamHandle()
-      : slam_cfg(std::make_shared<stella_vslam::config>("stellaconf.yaml")),
-        slam(slam_cfg, "orb_vocab.fbow") {
+  /* Paths are parameters so the Webots sim can point at
+     sim/config/stellaconf_sim.yaml without a working-directory trick.
+     Defaults preserve the previous hardcoded behaviour. */
+  explicit slamHandle(const std::string &config_path = "stellaconf.yaml",
+                      const std::string &vocab_path = "orb_vocab.fbow")
+      : slam_cfg(std::make_shared<stella_vslam::config>(config_path)),
+        slam(slam_cfg, vocab_path) {
     slam.startup();
   }
 };
@@ -46,7 +51,7 @@ float yawfromPose(Eigen::Matrix<double, 4, 4> &pose);
 
 std::string getStatus(slamHandle *handle);
 
-struct RGBDFrame *getColorDepthPair(struct rawColorDepthPair *frame, cv::Size &colorFrameSize, cv::Size &depthFrameSize);
+struct RGBDFrame *getColorDepthPair(struct rawColorDepthPair *frame);
 
 void resetLocalization(slamHandle *handle);
 

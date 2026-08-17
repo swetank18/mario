@@ -1,0 +1,39 @@
+#ifndef NAV_MAP_QUERY_HPP
+#define NAV_MAP_QUERY_HPP
+
+/* The seam between mapping and planning.
+ *
+ * A planner needs four things from a map and nothing more: how finely it is
+ * sampled, where it reaches, whether a point is blocked, and how much room
+ * there is around that point. grid_map, PCL and rerun stay on the mapping
+ * side of this header.
+ *
+ * Keep this file header-free. It is what stops the planner target from
+ * pulling in the mapping dependency tree, and a single <memory> in here would
+ * quietly undo the split -- there is a grep for it in tweaks/REFACTOR_NAV.md.
+ */
+
+namespace nav {
+
+class MapQuery {
+public:
+  virtual ~MapQuery() = default;
+
+  /* Metres per cell. Planners use it as their natural step size. */
+  virtual double resolution() const = 0;
+
+  /* World-frame extents in metres. */
+  virtual void bounds(double &min_x, double &min_y, double &max_x,
+                      double &max_y) const = 0;
+
+  /* True for obstacles, and for anything off the map. */
+  virtual bool occupied(double x, double y) const = 0;
+
+  /* Metres to the nearest obstacle. Large and finite when the map has seen
+     no obstacle at all, so callers can compare without a special case. */
+  virtual double clearance(double x, double y) const = 0;
+};
+
+} // namespace nav
+
+#endif

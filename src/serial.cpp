@@ -1,99 +1,120 @@
-#include <condition_variable>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <vector>
 
 #include "serial.hpp"
 
 namespace serial {
 
-std::mutex write_mtx;       // mutex to guard async write
-std::mutex read_mtx;        // mutex to guard async read
-std::mutex write_error_mtx; // mutex to gaurd error in async write
-std::mutex read_error_mtx;  // mutex to gaurd error in async read
-bool writeLocked = false;
-bool readLocked = false;
-std::condition_variable writeCV;
-std::condition_variable readCV;
-int write_err;
-int read_err;
+std::mutex write_mtx; // serialises writers
+std::mutex read_mtx;  // serialises readers, and guards rx_buffer
 
-void asyncWriteHandler(const boost::system::error_code &error,
-                       std::size_t bytes_transferred) {
-  std::unique_lock<std::mutex> elk(write_error_mtx);
-  if (error) {
-    write_err = error.value();
+namespace {
+
+/* Bytes carried over between reads. Only ever touched under read_mtx. A single
+   buffer is enough because the rest of this file already assumes one port. */
+std::vector<uint8_t> rx_buffer;
+
+/* Give up rather than grow without bound if the peer sends something that
+   never yields a delimiter. */
+constexpr size_t RX_MAX = 4096;
+
+/* A read gives up after this many waits for more bytes, so a silent or
+   half-speaking Nucleo faults plan() instead of stalling the mission. The
+   Nucleo streams at 10 Hz, so one 500 ms wait is already several frames. */
+constexpr int READ_ATTEMPTS = 8;
+constexpr int READ_WAIT_MS = 500;
+
+/* Pull in every byte the OS already has buffered. Nothing here blocks: FIONREAD
+   tells us exactly how much is waiting. */
+void drainAvailable(serial_port *serial, boost::system::error_code &ec) {
+  uint8_t chunk[512];
+  int pending = 0;
+
+  while (::ioctl(serial->native_handle(), FIONREAD, &pending) == 0 &&
+         pending > 0) {
+    const size_t want = std::min(static_cast<size_t>(pending), sizeof(chunk));
+    const size_t n =
+        boost::asio::read(*serial, boost::asio::buffer(chunk, want), ec);
+    rx_buffer.insert(rx_buffer.end(), chunk, chunk + n);
+    if (ec)
+      return;
   }
-  elk.unlock();
-
-  std::unique_lock<std::mutex> lk(write_mtx);
-  writeLocked = false;
-  lk.unlock();          // next write is possible
-  writeCV.notify_one(); // if there is next write() waiting, notify it so it can
-                        // continue
 }
 
-Error asyncWrite(serial_port *serial, const uint8_t msg[], size_t MSG_LEN) {
+/* Copy out the newest MSG_LEN frame in rx_buffer and drop everything up to and
+   including the last delimiter seen. Frames of any other length are skipped,
+   which is what resynchronises us after a partial write from the peer. */
+bool takeNewestFrame(uint8_t *frame, size_t MSG_LEN) {
+  bool found = false;
+  size_t start = 0;
+  size_t consumed = 0;
 
-  std::unique_lock<std::mutex> lock(write_mtx);
+  for (size_t i = 0; i < rx_buffer.size(); i++) {
+    if (rx_buffer[i] != 0x00)
+      continue;
 
-  if (writeLocked)
-    writeCV.wait(lock);
-
-  writeLocked = true; // set writeLocked true and begin writing
-
-  lock.unlock();
-
-  async_write(*serial, buffer(msg, MSG_LEN),
-              [](const boost::system::error_code &error,
-                 std::size_t bytes_transferred) {
-                asyncWriteHandler(error, bytes_transferred);
-              });
-  std::unique_lock<std::mutex> elk(write_error_mtx);
-
-  if (!write_err)
-    return Error::WriteSuccess;
-  else
-    return Error::AsioWriteError;
-}
-
-void asyncReadHandler(const boost::system::error_code &error,
-                      std::size_t bytes_transferred) {
-  std::unique_lock<std::mutex> elk(read_error_mtx);
-  if (error) {
-    read_err = error.value();
+    if (i - start + 1 == MSG_LEN) { // + 1 for the delimiter itself
+      std::memcpy(frame, &rx_buffer[start], MSG_LEN);
+      found = true;
+    }
+    start = i + 1;
+    consumed = start;
   }
-  elk.unlock();
 
-  std::unique_lock<std::mutex> lk(read_mtx);
-  readLocked = false;
-  lk.unlock();         // next write is possible
-  readCV.notify_one(); // if there is next write() waiting, notify it so it can
-                       // continue
+  rx_buffer.erase(rx_buffer.begin(), rx_buffer.begin() + consumed);
+  return found;
 }
 
-Error asyncRead(serial_port *serial, uint8_t *read_buffer, size_t MSG_LEN) {
-  std::unique_lock<std::mutex> lock(read_mtx);
+} // namespace
 
-  if (readLocked)
-    readCV.wait(lock);
+Error writeFrame(serial_port *serial, const uint8_t msg[], size_t MSG_LEN) {
+  std::lock_guard<std::mutex> lock(write_mtx);
 
-  readLocked = true;
+  boost::system::error_code ec;
+  // boost::asio::write, not ::write -- it loops over short writes for us.
+  boost::asio::write(*serial, boost::asio::buffer(msg, MSG_LEN), ec);
 
-  lock.unlock();
+  return ec ? Error::AsioWriteError : Error::WriteSuccess;
+}
 
-  async_read(*serial, boost::asio::buffer(read_buffer, MSG_LEN),
-             [](const boost::system::error_code &error,
-                std::size_t bytes_transferred) {
-               asyncReadHandler(error, bytes_transferred);
-             });
+Error readFrame(serial_port *serial, uint8_t *read_buffer, size_t MSG_LEN) {
+  std::lock_guard<std::mutex> lock(read_mtx);
 
-  std::unique_lock<std::mutex> elk(read_error_mtx);
+  boost::system::error_code ec;
 
-  if (!read_err)
-    return Error::ReadSuccess;
-  else
+  /* The Nucleo streams geodetic frames continuously but plan() only reads one
+     when it runs, so the front of the backlog can be many seconds stale. Drain
+     the whole backlog and navigate on the newest fix in it. */
+  drainAvailable(serial, ec);
+  if (ec)
     return Error::AsioReadError;
+
+  for (int attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
+    if (takeNewestFrame(read_buffer, MSG_LEN))
+      return Error::ReadSuccess;
+
+    if (rx_buffer.size() > RX_MAX)
+      rx_buffer.clear(); // desynced; pick the stream back up at a delimiter
+
+    /* Wait for more bytes ourselves. asio's synchronous read_some polls with
+       no deadline, and it ignores the port's VMIN/VTIME, so calling it here
+       would hang the mission whenever the Nucleo goes quiet. */
+    struct pollfd pfd = {serial->native_handle(), POLLIN, 0};
+    if (::poll(&pfd, 1, READ_WAIT_MS) <= 0)
+      return Error::AsioReadError;
+
+    drainAvailable(serial, ec);
+    if (ec)
+      return Error::AsioReadError;
+  }
+
+  return Error::AsioReadError;
 }
 
 void close(serial_port *serial) {
@@ -180,10 +201,9 @@ struct tarzan_msg get_tarzan_msg(float linear_x, float angular_z) {
   // DiffDrive var
   struct DiffDriveTwist cmd = {.linear_x = linear_x, .angular_z = angular_z};
 
-  uint32_t crc = serial::crc32_ieee(
+  msg.cmd = cmd;
+  msg.crc = serial::crc32_ieee(
       (uint8_t *)&msg, sizeof(struct tarzan::tarzan_msg) - sizeof(msg.crc));
-
-  msg = {.cmd = cmd, .crc = crc};
 
   // tarzan msg
   return msg;
@@ -202,10 +222,21 @@ int main(int argc, char *argv[]) {
   float angular_z = std::stof(argv[3]);
   tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(linear_x, angular_z);
 
-  std::string err =
-      serial::get_error(serial::write_msg<struct tarzan::tarzan_msg>(
-          nucleo, msg, tarzan::TARZAN_MSG_LEN));
+  while (true) {
+    // send data
+    serial::Error err = serial::write_msg<struct tarzan::tarzan_msg>(
+        nucleo, msg, tarzan::TARZAN_MSG_LEN);
+    std::string message = serial::get_error(err);
+    std::cout << "info : " << message << std::endl;
 
-  std::cout << "Message : " << err << std::endl;
+    // read data
+    struct tarzan::geodetic_msg geo_msg;
+    err = serial::read_msg<struct tarzan::geodetic_msg>(
+        nucleo, &geo_msg, tarzan::GEODETIC_MSG_LEN);
+    if (err == serial::AsioReadError || err == serial::CobsDecodeError)
+      std::cout << serial::get_error(err);
+    std::cout << "lat : " << geo_msg.geo_data.lat
+              << " lon : " << geo_msg.geo_data.lon << std::endl;
+  }
 }
 #endif

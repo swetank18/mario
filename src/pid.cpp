@@ -143,38 +143,32 @@ int main(int argc, char *argv[]) {
       frame_raw->depthFrame = depthFrame.get_data();
       frame_raw->timestamp = fs.get_timestamp();
 
-      cv::Size colorFrameSize(realsense_config.color_i.height,
-                              realsense_config.color_i.width);
-      cv::Size depthFrameSize(realsense_config.depth_i.height,
-                              realsense_config.depth_i.width);
-
-      struct slam::RGBDFrame *frame_cv =
-          slam::getColorDepthPair(frame_raw, colorFrameSize, depthFrameSize);
-
+      // get current pose
+      struct slam::RGBDFrame *frame_cv = slam::getColorDepthPair(frame_raw);
       res = slam::runLocalization(frame_cv, slam_handler);
-
       current_pose = utils::T_camera_base * res;
       auto translations = current_pose.col(3);
-      auto rotations = current_pose.block<3, 3>(0, 0);
       double yaw = (double)slam::yawfromPose(current_pose);
 
       uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-      angular_z = control::computeCommand(pid, target - yaw, previous - now);
-
-      previous = now;
-
-      std::cout << "Yaw : " << yaw << "Angular_Vel : " << angular_z
+      if (std::abs(target - yaw) < 0.01) { // tolerance = 0.05
+        angular_z = 0.0;
+      } else {
+        angular_z = std::clamp(
+            control::computeCommand(pid, target - yaw, now - previous), -5.5,
+            5.5);
+      }
+      std::cout << "Yaw : " << yaw << " Angular_Vel : " << angular_z
                 << std::endl;
-
+      previous = now;
       tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(linear_x, angular_z);
 
       std::string err =
           serial::get_error(serial::write_msg<struct tarzan::tarzan_msg>(
               nucleo, msg, tarzan::TARZAN_MSG_LEN));
-
-      std::cout << "Error : " << err << std::endl;
+      std::cout << "Serial Port : " << err << std::endl;
     }
   }
   serial::close(nucleo);

@@ -20,10 +20,8 @@ enum Error : uint8_t {
   AsioReadError
 };
 
-void asyncWriteHandler(const boost::system::error_code &error,
-                       std::size_t bytes_transferred);
-
-Error asyncWrite(serial_port *serial, const uint8_t msg[], size_t MSG_LEN);
+/* Writes a whole COBS frame, blocking until every byte has gone out. */
+Error writeFrame(serial_port *serial, const uint8_t msg[], size_t MSG_LEN);
 
 template <typename msgType>
 Error write_msg(serial_port *serial, const msgType &msg, size_t MSG_LEN) {
@@ -39,27 +37,30 @@ Error write_msg(serial_port *serial, const msgType &msg, size_t MSG_LEN) {
 
   buffer[MSG_LEN - 1] = 0x00;
 
-  return asyncWrite(serial, buffer, MSG_LEN);
+  return writeFrame(serial, buffer, MSG_LEN);
 }
 
-void asyncReadHandler(const boost::system::error_code &error,
-                      std::size_t bytes_transferred);
-Error asyncRead(serial_port *serial, uint8_t *read_buffer, size_t MSG_LEN);
+/* Fills read_buffer with the newest complete MSG_LEN frame, delimiter
+   included. Blocks until one is available or the port times out. */
+Error readFrame(serial_port *serial, uint8_t *read_buffer, size_t MSG_LEN);
 
 template <typename msg_type>
-Error read_msg(serial_port *serial, msg_type &buffer, size_t MSG_LEN) {
+Error read_msg(serial_port *serial, msg_type *buffer, size_t MSG_LEN) {
 
   uint8_t read_buffer[MSG_LEN];
-  Error err = asyncRead(serial, read_buffer, MSG_LEN);
+  if (Error err = readFrame(serial, read_buffer, MSG_LEN);
+      err != Error::ReadSuccess) {
+    return err;
+  }
 
-  if (auto result = cobs_decode(reinterpret_cast<void *>(buffer), MSG_LEN,
+  if (auto result = cobs_decode(reinterpret_cast<void *>(buffer), MSG_LEN-2,
                                 reinterpret_cast<const void *>(read_buffer),
-                                sizeof(read_buffer));
+                                MSG_LEN-1);
       result.status != COBS_DECODE_OK) {
     return Error::CobsDecodeError;
   }
 
-  return err;
+  return Error::ReadSuccess;
 }
 
 void close(serial_port *serial);
@@ -101,7 +102,8 @@ struct tarzan_msg {
 };
 
 constexpr size_t TARZAN_MSG_LEN = sizeof(tarzan_msg) + 2; // tarzan message len
-constexpr size_t GEODETIC_MSG_LEN = sizeof(geodetic_msg) + 2; // geodetic message len  
+constexpr size_t GEODETIC_MSG_LEN =
+    sizeof(geodetic_msg) + 2; // geodetic message len
 
 // construct tarzan message
 struct tarzan_msg get_tarzan_msg(float linear_x, float angular_z);

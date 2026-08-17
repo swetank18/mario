@@ -184,6 +184,12 @@ void yasmin_to_spdlog(yasmin::LogLevel level, const char *file,
 //   // log frame number
 //   rec.set_time_sequence("frame_nr", frame_nr);
 // }
+
+double normalize_angle(double angle){
+	while (angle > M_PI) angle -= 2.0 * M_PI; 
+	while (angle < -M_PI) angle += 2.0 * M_PI; 
+	return angle;
+}
 } // namespace utils
 
 #ifdef UTILS_TEST_CPP

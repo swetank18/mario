@@ -3,6 +3,7 @@
 
 #include <Eigen/Dense>
 #include <condition_variable>
+#include <mutex>
 #include <librealsense2/h/rs_sensor.h>
 #include <librealsense2/h/rs_types.h>
 #include <librealsense2/hpp/rs_frame.hpp>
@@ -136,7 +137,39 @@ public:
   }
 };
 
+/* Single-writer, many-reader cell holding the most recent value.
+   Unlike SafeQueue, a read does not consume: every reader sees the latest
+   value the writer published. Use this where consumers each need the current
+   state (e.g. rover pose) rather than a stream of every item. */
+template <class T> class SharedLatest {
+
+  T value{};
+  bool valid = false;
+  mutable std::mutex mtx;
+
+public:
+  SharedLatest() {}
+
+  void set(const T &item) {
+    std::lock_guard<std::mutex> lock(mtx);
+    value = item;
+    valid = true;
+  }
+
+  [[nodiscard]]
+  bool get(T &item) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!valid) {
+      return false;
+    }
+    item = value;
+    return true;
+  }
+};
+
 void yasmin_to_spdlog(yasmin::LogLevel level, const char *file,
                       const char *function, int line, const char *text);
+
+double normalize_angle(double angle);
 } // namespace utils
 #endif

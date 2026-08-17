@@ -29,7 +29,9 @@ float yawfromPose(Eigen::Matrix<double, 4, 4> &pose) {
   yaws[0] = atan2(pose(1, 0) / cos(pitch_1), pose(0, 0) / cos(pitch_1));
   yaws[1] = atan2(pose(1, 0) / cos(pitch_2), pose(0, 0) / cos(pitch_2));
 
-  return yaws[1] - M_PI_2;
+  double yaw = yaws[1] - M_PI_2;
+
+  return utils::normalize_angle(yaw);
 }
 
 std::string getStatus(slamHandle *handle) {
@@ -42,18 +44,16 @@ bool localizationLoopAdjustmentRunning(slamHandle *handle) {
   return handle->slam.loop_BA_is_running();
 }
 
-struct RGBDFrame *getColorDepthPair(struct rawColorDepthPair *frame,
-                                    cv::Size &colourFrameSize,
-                                    cv::Size &depthFrameSize) {
+struct RGBDFrame *getColorDepthPair(struct rawColorDepthPair *frame) {
 
   struct RGBDFrame *frame_cv = new RGBDFrame();
 
-  auto color_cv = cv::Mat(colourFrameSize, CV_8UC3, (void *)(frame->colorFrame),
-                          cv::Mat::AUTO_STEP);
+  auto color_cv = cv::Mat(cv::Size(640, 480), CV_8UC3,
+                          (void *)(frame->colorFrame), cv::Mat::AUTO_STEP);
   cv::cvtColor(color_cv, color_cv, cv::COLOR_BGR2RGB);
 
-  auto depth_cv = cv::Mat(depthFrameSize, CV_16U, (void *)(frame->depthFrame),
-                          cv::Mat::AUTO_STEP);
+  auto depth_cv = cv::Mat(cv::Size(640, 480), CV_16U,
+                          (void *)(frame->depthFrame), cv::Mat::AUTO_STEP);
 
   auto timestamp_cv = frame->timestamp;
 
@@ -112,14 +112,15 @@ int main() {
 
     if (rs2::frameset fs = frame.as<rs2::frameset>()) {
 
-      struct slam::rawColorDepthPair *frame_raw;
+      auto aligned_frames = rs_ptr->align.process(fs);
+      rs2::video_frame colorFrame = aligned_frames.first(RS2_STREAM_COLOR);
+      rs2::video_frame depthFrame = aligned_frames.get_depth_frame();
 
-      cv::Size colorFrameSize(realsense_config.color_i.height,
-                              realsense_config.color_i.width);
-      cv::Size depthFrameSize(realsense_config.depth_i.height,
-                              realsense_config.depth_i.width);
-
-    struct slam::RGBDFrame *frame_cv = slam::getColorDepthPair(frame_raw, colorFrameSize, depthFrameSize);
+      struct slam::rawColorDepthPair *frame_raw = new slam::rawColorDepthPair;
+      frame_raw->colorFrame = colorFrame.get_data();
+      frame_raw->depthFrame = depthFrame.get_data();
+      frame_raw->timestamp = fs.get_timestamp(); 
+      struct slam::RGBDFrame *frame_cv = slam::getColorDepthPair(frame_raw);
 
       res = slam::runLocalization(frame_cv, slam_handler);
       current_pose = camera_to_ned_transform * res;

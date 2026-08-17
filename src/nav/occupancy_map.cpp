@@ -39,6 +39,27 @@ OccupancyMap::OccupancyMap(const MapParams &params)
   distance_.assign(map_.getSize()(0) * map_.getSize()(1), kUnreached);
 }
 
+void OccupancyMap::recenter(double x, double y) {
+  /* move() slides the window by whole cells and reports whether it shifted at
+     all, so a rover sitting still costs one comparison. Cells that scroll in
+     are set to NAN, which is already this map's "never observed" value. */
+  if (!map_.move(grid_map::Position(x, y)))
+    return;
+
+  /* move() rotates grid_map's circular buffer rather than copying the data,
+     so buffer index (0,0) stops being the map's corner. rebuildDistanceField
+     walks neighbours with plain row-major arithmetic, which would then step
+     across the wrap seam and treat cells a full map apart as touching.
+     Normalising the start index costs one shift per boundary crossing and
+     keeps every index in this file meaning what it meant when the map was
+     fixed. */
+  map_.convertToDefaultStartIndex();
+
+  /* The obstacle set changed -- cells left the map and unknown ones came in --
+     so the field the planner reads is stale until this runs. */
+  rebuildDistanceField();
+}
+
 void OccupancyMap::integrate(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
                              const Eigen::Matrix<double, 4, 4> &T) {
   pcl::transformPointCloud(*cloud, *cloud, T);

@@ -255,6 +255,13 @@ auto mapping(nav::OccupancyMap &occupancy_map,
     T_pc.linear() = R_yaw * utils::T_camera_base.block<3, 3>(0, 0);
     T_pc.translation() = Eigen::Vector3d(pose.x, pose.y, pose.z);
 
+    /* Follow the rover before folding the cloud in, so the points land on a
+       grid that still covers it. The map used to be a fixed box around the
+       SLAM origin, which put the rover off its own map once it got further
+       than dim/2 -- 10 m with the sim config, against a first waypoint 14 m
+       out. */
+    occupancy_map.recenter(pose.x, pose.y);
+
     occupancy_map.integrate(cloud, T_pc.matrix());
     occupancy_map.log(rec);
 
@@ -303,14 +310,27 @@ private:
     double relative_angle =
         utils::normalize_angle(target_angle_global - rover_angle_global);
 
-    double local_goal_dist =
-        std::min(total_distance, (double)map_.params().dim[1]);
+    /* The map reaches dim/2 from the rover, not dim, and a goal planted on the
+       very edge has no room for the safety margin either. Clamp to the
+       half-extent of the shorter side, less a margin, so the goal is always
+       somewhere the planner can actually reach. */
+    const double half_extent =
+        std::min(map_.params().dim[0], map_.params().dim[1]) / 2.0;
+    const double reachable = std::max(
+        half_extent - 4.0 * planner_params_.safety_margin, map_.resolution());
+    double local_goal_dist = std::min(total_distance, reachable);
 
     double target_x = local_goal_dist * std::cos(relative_angle);
     double target_y = local_goal_dist * std::sin(relative_angle);
 
-    float local_goal_x = pose.x + (target_x * std::cos(pose.yaw));
-    float local_goal_y = pose.y + (target_y * std::sin(pose.yaw));
+    /* Full 2D rotation into the world frame. The cross terms were dropped
+       here, so the goal only landed correctly when the rover happened to be
+       pointing along an axis -- a leg could look planned and still set off at
+       an angle. */
+    float local_goal_x =
+        pose.x + (target_x * std::cos(pose.yaw) - target_y * std::sin(pose.yaw));
+    float local_goal_y =
+        pose.y + (target_x * std::sin(pose.yaw) + target_y * std::cos(pose.yaw));
 
     return std::make_tuple(local_goal_x, local_goal_y);
   }
@@ -643,6 +663,9 @@ public:
 public:
   nav::OccupancyMap &map_;
   nav::Planner &planner_;
+  /* Kept alongside the planner because get_local_goal has to size the local
+     goal against the same margin the planner will demand of the path. */
+  nav::PlannerParams planner_params_;
   struct control::Pid *pid_ctx;
   boost::asio::serial_port *serial;
   utils::SharedLatest<struct slam::slamPose> &poseState;
@@ -660,14 +683,15 @@ public:
   Waypoint current_waypoint{};
 
   StateMachine(nav::OccupancyMap &map, nav::Planner &planner,
+               const nav::PlannerParams &planner_params,
                struct control::Pid *pid, boost::asio::serial_port *ser,
                utils::SharedLatest<struct slam::slamPose> &pose_state,
                tarzan::DiffDriveTwist cmd, slam::slamHandle *sh,
                zmq::socket_t &csub, const rerun::RecordingStream &r,
                YOLO8Detector *det)
-      : map_(map), planner_(planner), pid_ctx(pid), serial(ser),
-        poseState(pose_state), drive_cmd(cmd), slam_handler(sh),
-        color_sub(csub), rec(r), detector(det) {};
+      : map_(map), planner_(planner), planner_params_(planner_params),
+        pid_ctx(pid), serial(ser), poseState(pose_state), drive_cmd(cmd),
+        slam_handler(sh), color_sub(csub), rec(r), detector(det) {};
 
   /* The graph itself is in include/fsm.hpp, shared with test/fsm_test.cpp. */
   auto run() -> int { return fsm::run(*this); }
@@ -804,7 +828,8 @@ int main(int argc, char *argv[]) {
   }
   spdlog::info(std::format("Successful connection to {}", SERIAL_PORT));
 
-  StateMachine sm(occupancy_map, *planner, pid_ctx, serial, poseState,
+  StateMachine sm(occupancy_map, *planner, planner_params, pid_ctx, serial,
+                  poseState,
                   tarzan::DiffDriveTwist{vm["linear"].as<float>(),
                                          vm["angular"].as<float>()},
                   slam_handler, color_sub, rec, detector);

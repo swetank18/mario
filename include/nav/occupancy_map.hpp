@@ -20,6 +20,13 @@ class OccupancyMap : public MapQuery {
 public:
   explicit OccupancyMap(const MapParams &params);
 
+  /* Slides the grid so it stays centred on (x, y), keeping the overlap and
+     resetting whatever scrolls into view to unknown. Without this the map is
+     a fixed box around the SLAM origin and the rover drives off it at
+     dim/2. Cheap to call every frame -- it is a no-op until the rover
+     crosses a cell boundary. */
+  void recenter(double x, double y);
+
   /* Filters `cloud` in place, lifts it by `T` and folds it into the elevation
      layer. */
   void integrate(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,

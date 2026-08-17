@@ -51,7 +51,16 @@ struct OmplPlanner::Impl {
   ob::SpaceInformationPtr si;
   std::shared_ptr<og::RRTConnect> planner;
 
-  Impl(const MapQuery &m, const PlannerParams &p) : map(m), params(p) {
+  /* Pulls the map's current extent into the state space. Called on every plan
+     because the map recentres on the rover -- bounds fixed at construction
+     would keep sampling the box the map occupied when the process started,
+     and every state the rover has since driven to would read as invalid.
+
+     No re-setup() after this: recentring slides the box without resizing it,
+     so getMaximumExtent() and the longest-valid-segment length OMPL caches at
+     setup are still right. That stops being true if the map is ever given a
+     resizable footprint. */
+  void syncBounds() {
     double min_x, min_y, max_x, max_y;
     map.bounds(min_x, min_y, max_x, max_y);
 
@@ -64,8 +73,12 @@ struct OmplPlanner::Impl {
     bounds.setLow(1, min_y);
     bounds.setHigh(1, max_y);
 
-    space = std::make_shared<ob::RealVectorStateSpace>(2);
     space->as<ob::RealVectorStateSpace>()->setBounds(bounds);
+  }
+
+  Impl(const MapQuery &m, const PlannerParams &p) : map(m), params(p) {
+    space = std::make_shared<ob::RealVectorStateSpace>(2);
+    syncBounds();
 
     si = std::make_shared<ob::SpaceInformation>(space);
     si->setStateValidityChecker(
@@ -83,6 +96,8 @@ OmplPlanner::~OmplPlanner() = default;
 
 std::optional<Path> OmplPlanner::plan(const Waypoint &start,
                                       const Waypoint &goal) {
+  impl_->syncBounds();
+
   ob::ScopedState<> from(impl_->space);
   from->as<ob::RealVectorStateSpace::StateType>()->values[0] = start.x;
   from->as<ob::RealVectorStateSpace::StateType>()->values[1] = start.y;

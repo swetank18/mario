@@ -120,6 +120,13 @@ if(BUILD_TESTS)
   target_link_libraries(fsm_test PRIVATE Threads::Threads)
   add_test(NAME fsm COMMAND fsm_test)
 
+  # nav test -- drives OccupancyMap and AStarPlanner together over a simulated
+  # 14 m leg. Needs no SLAM, no RealSense and no rerun viewer, so it covers the
+  # recentring/clearance behaviour without the rest of the stack being up.
+  add_executable(nav_test test/nav_test.cpp)
+  target_link_libraries(nav_test PRIVATE nav_map nav_planner)
+  add_test(NAME nav COMMAND nav_test)
+
   # aruco test -- src/aruco.cpp is not in the tree, so only wire this up if it
   # reappears. Referencing it unconditionally fails the configure step.
   if(EXISTS ${CMAKE_SOURCE_DIR}/src/aruco.cpp)

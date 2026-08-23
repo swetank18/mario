@@ -127,6 +127,14 @@ if(BUILD_TESTS)
   target_link_libraries(nav_test PRIVATE nav_map nav_planner)
   add_test(NAME nav COMMAND nav_test)
 
+  # planner test -- AStarPlanner against a synthetic MapQuery. Links
+  # nav_planner and nothing else, so it doubles as the structural check that
+  # the mapping dependency tree has not leaked back through map_query.hpp: if
+  # this target ever needs PCL, grid_map or rerun to link, the split is gone.
+  add_executable(planner_test test/planner_test.cpp)
+  target_link_libraries(planner_test PRIVATE nav_planner)
+  add_test(NAME planner COMMAND planner_test)
+
   # aruco test -- src/aruco.cpp is not in the tree, so only wire this up if it
   # reappears. Referencing it unconditionally fails the configure step.
   if(EXISTS ${CMAKE_SOURCE_DIR}/src/aruco.cpp)

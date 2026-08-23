@@ -117,11 +117,37 @@ std::optional<Path> AStarPlanner::plan(const Waypoint &start,
       if (!passable(there))
         continue;
 
+      /* Two different things push the path around. clearance() is about the
+         rover's body -- how close the twist controller dares shave a rock.
+         traversal_cost() is about the terrain under the wheels, graded the
+         way PathPlanning-Astar grades it, so a passable-but-broken cell costs
+         more to cross than clean ground at the same distance. */
+      const double terrain = map_.traversal_cost(there.x, there.y);
+      if (terrain >= kImpassable)
+        continue;
+
       const double room = std::min(map_.clearance(there.x, there.y), influence);
       const double penalty = (influence - room) / influence;
+
+      /* The heading we arrived on is the step out of came_from[current].
+         Charging for a change of heading makes the cost depend on the path
+         taken rather than on the cell alone, so the result is no longer
+         provably optimal -- PathPlanning-Astar accepts the same trade, and
+         for the same reason: an optimal staircase across open ground is worse
+         to drive than a marginally longer straight line, because traverse_path
+         re-aims the rover at every corner. */
+      double turn = 0.0;
+      const int prev = came_from[current];
+      if (prev != -1 &&
+          (current / ny - prev / ny != kStepX[n] ||
+           current % ny - prev % ny != kStepY[n]))
+        turn = params_.turn_penalty;
+
       const double step =
           distance(here, there) *
-          (1.0 + params_.obstacle_cost_weight * penalty);
+              (1.0 + params_.obstacle_cost_weight * penalty +
+               params_.terrain_cost_weight * terrain) +
+          turn;
 
       if (cost[current] + step >= cost[next])
         continue;

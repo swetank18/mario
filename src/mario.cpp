@@ -210,9 +210,28 @@ auto mapping(nav::OccupancyMap &occupancy_map,
   std::vector<float> points_buffer;
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(
       new pcl::PointCloud<pcl::PointXYZ>());
-  /* Identity, not default-constructed: an Affine3d leaves its bottom row
-     uninitialised, and transformPointCloud reads the whole 4x4. */
-  Eigen::Affine3d T_pc = Eigen::Affine3d::Identity();
+
+  /* Where the depth camera sits on the rover, in the base FLU frame. Constant
+     for the life of the run, so it is built once out here.
+
+     Identity first, not default-constructed: an Affine3d leaves its bottom row
+     uninitialised, and transformPointCloud reads the whole 4x4.
+
+     The translation is the part that used to be missing. T_camera_base only
+     ever carried the optical->FLU rotation, so the cloud was folded in as
+     though the camera were bolted to the ground at the base origin: flat
+     ground came out at z = -0.62 m against a -0.25 m ditch threshold, and
+     every square metre the camera could see was mapped as a negative
+     obstacle. The 0.40 m of forward offset was missing too, which put every
+     rock 40 cm nearer than it really was. */
+  Eigen::Affine3d T_base_sensor = Eigen::Affine3d::Identity();
+  T_base_sensor.linear() = utils::T_camera_base.block<3, 3>(0, 0);
+  T_base_sensor.translation() =
+      Eigen::Vector3d(occupancy_map.params().sensor_offset[0],
+                      occupancy_map.params().sensor_offset[1],
+                      occupancy_map.params().sensor_offset[2]);
+
+  Eigen::Affine3d T_world_base = Eigen::Affine3d::Identity();
 
   while (true) {
 
@@ -244,16 +263,12 @@ auto mapping(nav::OccupancyMap &occupancy_map,
       continue;
     }
 
-    /* cloud is in the camera optical frame; lift it into the SLAM world frame
-       via camera->base, then the rover's own heading. Dropping the yaw term
+    /* Only the rover's own pose changes per frame. Dropping the yaw term
        stamps obstacles into the map as if the rover never turned. */
-    const Eigen::Matrix3d R_yaw =
+    T_world_base.linear() =
         Eigen::AngleAxisd(pose.yaw, Eigen::Vector3d::UnitZ())
             .toRotationMatrix();
-
-    T_pc.setIdentity();
-    T_pc.linear() = R_yaw * utils::T_camera_base.block<3, 3>(0, 0);
-    T_pc.translation() = Eigen::Vector3d(pose.x, pose.y, pose.z);
+    T_world_base.translation() = Eigen::Vector3d(pose.x, pose.y, pose.z);
 
     /* Follow the rover before folding the cloud in, so the points land on a
        grid that still covers it. The map used to be a fixed box around the
@@ -262,7 +277,10 @@ auto mapping(nav::OccupancyMap &occupancy_map,
        out. */
     occupancy_map.recenter(pose.x, pose.y);
 
-    occupancy_map.integrate(cloud, T_pc.matrix());
+    /* Kept apart on purpose: the map applies the config's rover-relative
+       passthrough limits in the base frame, between the two. */
+    occupancy_map.integrate(cloud, T_world_base.matrix(),
+                            T_base_sensor.matrix());
     occupancy_map.log(rec);
 
     /* Only the first grid is a milestone -- the FSM waits on it once before

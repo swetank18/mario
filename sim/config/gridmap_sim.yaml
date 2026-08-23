@@ -21,6 +21,40 @@ grid_map:
   # true refuses most goals until coverage improves. Team call, not a default
   # to flip casually.
   unknown_is_occupied: false
+  # How much of a cell's stored elevation survives a fresh look at it. The map
+  # used to keep the most extreme value ever written, so anything that moved
+  # through the scene left a wall that only a restart cleared.
+  elevation_retain: 0.6
+  # Integrations a cell may go unobserved before it reverts to unknown.
+  forget_after: 40
+  # Graded cost for ground that is passable but not flat, for the three bands
+  # below pos_obstacle_threshold h: (h/2, h], (h/4, h/2], flatter than h/4.
+  # Same bands PathPlanning-Astar's create_gridmap uses.
+  rough_cost: [5.0, 1.0, 0.0]
+
+# Where the depth sensor sits in the rover's base FLU frame, in metres:
+# x forward, y left, z above the wheel contact plane.
+#
+# MarioRover.proto mounts the camera and range-finder at "0.40 0 0.62", and the
+# wheel anchors sit at z 0.15 with radius 0.15, so the body origin is exactly
+# at ground level and 0.62 is a true height above the contact plane.
+#
+# This was implicitly {0, 0, 0} until now, which is why every ground return
+# landed at -0.62 m and the whole visible course mapped as a ditch. Measure it
+# on the real rover before a field run -- it is not the same mast.
+sensor:
+  offset:
+    x: 0.40
+    y: 0.0
+    z: 0.62
+
+# Re-measure the ground plane from each cloud and threshold relative to it,
+# rather than trusting z = 0 to be the ground. Rough terrain and SLAM z-drift
+# both move the apparent plane by more than the 0.25 m obstacle threshold.
+ground:
+  estimate: true
+  window: 5.0        # metres around the rover that count as ground candidates
+  max_height: 0.25   # candidates above this are obstacles, not ground
 
 filters:
   min_filtering_points: 100
@@ -52,3 +86,10 @@ planner:
   # by safety_margin. 0 gives the shortest route regardless of how close it
   # shaves; higher hugs the middle of the gap.
   obstacle_cost_weight: 2.0
+  # How much a cell's graded terrain cost counts against the metres it takes to
+  # cross it. 0 ignores roughness and plans the shortest clear line.
+  terrain_cost_weight: 0.2
+  # Flat surcharge, in metres-equivalent, for a step that changes heading.
+  # Without it A* staircases across open ground and traverse_path re-aims the
+  # rover on every cell.
+  turn_penalty: 0.1

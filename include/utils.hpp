@@ -15,8 +15,6 @@
 #include <yasmin/logs.hpp>
 #include <zmq.hpp>
 
-#include "slam.hpp"
-
 namespace utils {
 
 struct rs_handler {

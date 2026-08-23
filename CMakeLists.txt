@@ -60,6 +60,35 @@ target_link_libraries(
   slam PUBLIC utils rerun_sdk Eigen3::Eigen stella_vslam::stella_vslam
               ${GLEW_LIBS} ${Pangolin_LIBS})
 
+# slam: the backend seam. include/slam/backend.hpp is header-only and pulls in
+# nothing, which is what stops stella_vslam -- or ROS and TensorRT, once
+# AirSLAM lands -- from reaching every translation unit that only wants a pose.
+add_library(slam_backend INTERFACE)
+target_include_directories(slam_backend INTERFACE include)
+
+# slam: stella_vslam backend. Owns the stella_vslam dependency; nothing that
+# links slam_backend alone inherits it.
+add_library(slam_stella src/slam/stella_backend.cpp)
+target_include_directories(slam_stella PUBLIC include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(slam_stella PUBLIC slam_backend slam ${OpenCV_LIBS}
+                                         spdlog::spdlog)
+
+# slam: AirSLAM backend. OFF by default -- it needs ROS noetic, CUDA, TensorRT,
+# Ceres and G2O, none of which are in flake.nix. With the option off the
+# translation unit still builds and the constructor throws, so the seam stays
+# exercised and the target list does not change shape between configurations.
+# docs/AIRSLAM_INTEGRATION.md covers what turning it on actually requires.
+option(MARIO_WITH_AIRSLAM "Build the AirSLAM SLAM backend" OFF)
+add_library(slam_airslam src/slam/airslam_backend.cpp)
+target_include_directories(slam_airslam PUBLIC include)
+target_link_libraries(slam_airslam PUBLIC slam_backend spdlog::spdlog)
+if(MARIO_WITH_AIRSLAM)
+  target_compile_definitions(slam_airslam PRIVATE MARIO_WITH_AIRSLAM)
+  target_include_directories(slam_airslam PUBLIC ${AIRSLAM_INCLUDE_DIRS}
+                                                 ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(slam_airslam PUBLIC ${AIRSLAM_LIBRARIES} ${OpenCV_LIBS})
+endif()
+
 # nav: parameter loading
 add_library(nav_params src/nav/params.cpp)
 target_include_directories(nav_params PUBLIC include)
@@ -147,14 +176,15 @@ endif()
 
 add_executable(mario ${CMAKE_SOURCE_DIR}/src/mario.cpp)
 
-target_include_directories(mario PRIVATE yasmin slam serial utils nav_map
-                                         nav_planner pid)
+target_include_directories(mario PRIVATE yasmin slam_backend slam_stella serial
+                                         utils nav_map nav_planner pid)
 
 target_link_libraries(
   mario
   PRIVATE yasmin
           Boost::program_options
-          slam
+          slam_backend
+          slam_stella
           utils
           serial
           nav_map

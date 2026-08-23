@@ -41,7 +41,8 @@
 #include "nav/planner_astar.hpp"
 #include "pid.hpp"
 #include "serial.hpp"
-#include "slam.hpp"
+#include "slam/backend.hpp"
+#include "slam/stella_backend.hpp"
 #include "utils.hpp"
 #include "yolo.hpp"
 
@@ -140,21 +141,25 @@ auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
 }
 
 /* function to get slam pose */
-auto localize(struct slam::slamHandle *slam_handler,
-              utils::SharedLatest<struct slam::slamPose> &poseState,
+auto localize(slam::Backend &backend,
+              utils::SharedLatest<struct slam::Pose> &poseState,
               zmq::socket_t &sub, const rerun::RecordingStream &rec,
               utils::rs_config realsense_config) -> void {
 
-  Eigen::Matrix<double, 4, 4> current_pose;
-  Eigen::Matrix<double, 4, 4> res;
   std::vector<zmq::message_t> colorFrameMsg;
   std::vector<zmq::message_t> depthFrameMsg;
   std::vector<zmq::message_t> timestampMsg;
   zmq::recv_result_t result_color;
   zmq::recv_result_t result_depth;
   zmq::recv_result_t result_timestamp;
-  struct slam::rawColorDepthPair *frame_raw = new slam::rawColorDepthPair;
-  struct slam::RGBDFrame *frame_cv;
+
+  slam::Frame frame;
+  /* rs_config's `height` and `width` are swapped relative to how they are
+     handed to enable_stream -- a known bug, on the out-of-scope list in
+     tweaks/REFACTOR_NAV.md. `height` is the field holding 640, so it is the
+     image width. This reproduces the size slam.cpp used to hardcode. */
+  frame.width = realsense_config.height;
+  frame.height = realsense_config.width;
 
   while (true) {
     result_color = zmq::recv_multipart(sub, std::back_inserter(colorFrameMsg));
@@ -170,27 +175,21 @@ auto localize(struct slam::slamHandle *slam_handler,
       continue;
     }
 
-    frame_raw->colorFrame = colorFrameMsg[1].data();
-    frame_raw->depthFrame = depthFrameMsg[1].data();
-    frame_raw->timestamp = std::stod(timestampMsg[1].to_string());
+    /* Borrowed for the duration of track(), not owned. The old path
+       heap-allocated a rawColorDepthPair and an RGBDFrame every iteration and
+       freed neither. */
+    frame.first = colorFrameMsg[1].data();
+    frame.second = depthFrameMsg[1].data();
+    frame.timestamp = std::stod(timestampMsg[1].to_string());
 
-    frame_cv = slam::getColorDepthPair(frame_raw);
+    struct slam::Pose pose;
+    if (backend.track(frame, pose)) {
+      poseState.set(pose);
 
-    res = slam::runLocalization(frame_cv, slam_handler);
-
-    current_pose = utils::T_camera_base * res;
-    auto translations = current_pose.col(3);
-
-    float x = translations.x();
-    float y = translations.y();
-    float z = translations.z();
-    float yaw = slam::yawfromPose(current_pose);
-
-    struct slam::slamPose pose = {.x = x, .y = y, .z = z, .yaw = yaw};
-    poseState.set(pose);
-
-    std::string coordinates = std::format("x: {} y: {} yaw: {}", x, y, yaw);
-    rec.log("SlamPose", rerun::TextLog(coordinates));
+      std::string coordinates =
+          std::format("x: {} y: {} yaw: {}", pose.x, pose.y, pose.yaw);
+      rec.log("SlamPose", rerun::TextLog(coordinates));
+    }
 
     colorFrameMsg.clear();
     depthFrameMsg.clear();
@@ -200,11 +199,11 @@ auto localize(struct slam::slamHandle *slam_handler,
 
 /* function to create gridmap  */
 auto mapping(nav::OccupancyMap &occupancy_map,
-             utils::SharedLatest<struct slam::slamPose> &poseState,
+             utils::SharedLatest<struct slam::Pose> &poseState,
              zmq::socket_t &sub, const rerun::RecordingStream &rec,
              utils::rs_config realsense_config) -> void {
 
-  struct slam::slamPose pose;
+  struct slam::Pose pose;
   std::vector<zmq::message_t> pointcloud_msg;
   zmq::recv_result_t result_pointcloud;
   std::vector<float> points_buffer;
@@ -314,7 +313,7 @@ private:
 
   auto get_local_goal(struct tarzan::geodetic &current_gps,
                       double target_latitude, double target_longitude,
-                      slam::slamPose &pose) -> std::tuple<float, float> {
+                      slam::Pose &pose) -> std::tuple<float, float> {
     double dLat = DEG2RAD(target_latitude - current_gps.lat);
     double dLon = DEG2RAD(target_longitude - current_gps.lon);
 
@@ -391,7 +390,7 @@ public:
   }
 
   auto slam_tracking() -> bool {
-    return slam::getStatus(slam_handler) == "Tracking";
+    return backend_.status() == slam::Tracking::Tracking;
   }
 
   auto clear_path() -> void { current_path.reset(); }
@@ -441,10 +440,10 @@ public:
       if (std::chrono::steady_clock::now() > deadline)
         return TraverseResult::REPLAN_TIMEOUT;
 
-      if (slam::getStatus(slam_handler) != "Tracking")
+      if (backend_.status() != slam::Tracking::Tracking)
         return TraverseResult::FAULT_SLAM;
 
-      slam::slamPose pose;
+      slam::Pose pose;
       if (!poseState.get(pose)) {
         spdlog::error("State Machine : No pose available yet");
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -638,7 +637,7 @@ public:
   }
 
   auto plan() -> PlanResult {
-    slam::slamPose pose;
+    slam::Pose pose;
     if (!poseState.get(pose)) {
       spdlog::error("plan: unable to fetch pose");
       return PlanResult::FAULT;
@@ -686,9 +685,9 @@ public:
   nav::PlannerParams planner_params_;
   struct control::Pid *pid_ctx;
   boost::asio::serial_port *serial;
-  utils::SharedLatest<struct slam::slamPose> &poseState;
+  utils::SharedLatest<struct slam::Pose> &poseState;
   tarzan::DiffDriveTwist drive_cmd;
-  slam::slamHandle *slam_handler;
+  slam::Backend &backend_;
   std::optional<nav::Path> current_path;
   std::queue<Waypoint> waypoints;
   zmq::socket_t &color_sub;
@@ -703,13 +702,13 @@ public:
   StateMachine(nav::OccupancyMap &map, nav::Planner &planner,
                const nav::PlannerParams &planner_params,
                struct control::Pid *pid, boost::asio::serial_port *ser,
-               utils::SharedLatest<struct slam::slamPose> &pose_state,
-               tarzan::DiffDriveTwist cmd, slam::slamHandle *sh,
+               utils::SharedLatest<struct slam::Pose> &pose_state,
+               tarzan::DiffDriveTwist cmd, slam::Backend &backend,
                zmq::socket_t &csub, const rerun::RecordingStream &r,
                YOLO8Detector *det)
       : map_(map), planner_(planner), planner_params_(planner_params),
         pid_ctx(pid), serial(ser), poseState(pose_state), drive_cmd(cmd),
-        slam_handler(sh), color_sub(csub), rec(r), detector(det) {};
+        backend_(backend), color_sub(csub), rec(r), detector(det) {};
 
   /* The graph itself is in include/fsm.hpp, shared with test/fsm_test.cpp. */
   auto run() -> int { return fsm::run(*this); }
@@ -786,10 +785,16 @@ int main(int argc, char *argv[]) {
       .height = 640, .width = 480, .fps = 30, .enable_imu = false};
   struct utils::rs_handler *rs_ptr = nullptr;
 
-  /* slam vars */
-  struct slam::slamHandle *slam_handler = new slam::slamHandle(
+  /* slam vars.
+
+     Held as a Backend, so which SLAM system this is stops being visible past
+     this line. Swapping in AirSlamBackend is a change to this construction
+     and to how the RealSense is configured -- backend->wants() says which
+     pair of images it needs -- and to nothing else. See
+     docs/AIRSLAM_INTEGRATION.md for what that costs today. */
+  std::unique_ptr<slam::Backend> backend = std::make_unique<slam::StellaBackend>(
       vm["slam_config"].as<std::string>(), vm["slam_vocab"].as<std::string>());
-  utils::SharedLatest<struct slam::slamPose> poseState;
+  utils::SharedLatest<struct slam::Pose> poseState;
 
   /* mapping & path planning vars */
   const std::string nav_cfg = vm["gridmap_config"].as<std::string>();
@@ -850,7 +855,7 @@ int main(int argc, char *argv[]) {
                   poseState,
                   tarzan::DiffDriveTwist{vm["linear"].as<float>(),
                                          vm["angular"].as<float>()},
-                  slam_handler, color_sub, rec, detector);
+                  *backend, color_sub, rec, detector);
 
   /* CONFIGURING ZMQ SOCKETS */
   /* Only bind when we are the publisher. In sim the bridge has already bound
@@ -895,7 +900,7 @@ int main(int argc, char *argv[]) {
   std::thread capture_thread;
   if (!sim_mode)
     capture_thread = std::thread(capture_frame, rs_ptr, std::ref(pub));
-  std::thread localize_thread(localize, slam_handler, std::ref(poseState),
+  std::thread localize_thread(localize, std::ref(*backend), std::ref(poseState),
                               std::ref(slam_sub), std::ref(rec),
                               realsense_config);
   std::thread mapping_thread(mapping, std::ref(occupancy_map),
@@ -942,7 +947,6 @@ int main(int argc, char *argv[]) {
   localize_thread.join();
   mapping_thread.join();
 
-  delete slam_handler;
   delete pid_ctx;
   delete detector;
   if (rs_ptr)

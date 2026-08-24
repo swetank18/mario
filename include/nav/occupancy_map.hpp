@@ -70,6 +70,9 @@ public:
 
 private:
   /* All the unlocked internals. Callers hold mtx_ before entering these. */
+  /* Strips the sensor's "no return" vertices. Sensor frame only -- see the
+     note on the definition. */
+  void dropNullReturns(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) const;
   void filter(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) const;
   float estimateGround(const pcl::PointCloud<pcl::PointXYZ> &cloud) const;
   bool isObstacle(float elevation) const;

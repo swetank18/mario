@@ -156,6 +156,19 @@ if(BUILD_TESTS)
   target_link_libraries(nav_test PRIVATE nav_map nav_planner)
   add_test(NAME nav COMMAND nav_test)
 
+  # mapping test -- OccupancyMap driven through the depth pipeline the rover
+  # actually has: a synthetic range image unprojected into the OpenCV optical
+  # frame the way sim/controllers/mario_bridge does it, no-return (0,0,0)
+  # vertices included, then folded in with the real sensor extrinsic. nav_test
+  # hands integrate() world-frame clouds of nothing but valid returns, so
+  # between them the two suites left T_base_sensor and the no-return
+  # convention uncovered -- which is exactly where the phantom-obstacle bug
+  # lived. Reads the sim gridmap config, so it also checks that parses.
+  add_executable(mapping_test test/mapping_test.cpp)
+  target_link_libraries(mapping_test PRIVATE nav_map nav_planner)
+  add_test(NAME mapping COMMAND mapping_test
+                                ${CMAKE_SOURCE_DIR}/sim/config/gridmap_sim.yaml)
+
   # planner test -- AStarPlanner against a synthetic MapQuery. Links
   # nav_planner and nothing else, so it doubles as the structural check that
   # the mapping dependency tree has not leaked back through map_query.hpp: if

@@ -1,3 +1,102 @@
+# Mapping fix and autonomy check — 2026-08-25
+
+On top of the 2026-08-23 pass below. Branch `fix/mapping-extrinsic-and-astar`,
+nothing pushed.
+
+## The bug
+
+**Every frame stamped a solid obstacle 0.40 m in front of the rover, and the
+rover then drove onto it.**
+
+A depth sensor publishes "no return" as an exact `(0,0,0)` vertex rather than a
+NaN — 45% of a 640x480 frame off the Webots bridge, about 139k points.
+`OccupancyMap::filter()` had a guard for exactly that, and the comment on it
+described exactly this failure. But `integrate()` ran it *after*
+`T_base_sensor`, and a no-return only sits at the origin until the extrinsic
+moves it: afterwards it sits on the camera mount, at (0.40, 0, 0.62) in the
+base frame. `p.x == 0 && p.y == 0 && p.z == 0` could never match again. The
+guard has been dead since the extrinsic landed in `dd441bc`.
+
+So the whole invalid half of every cloud voxelled down to one cell 0.40 m
+ahead at 0.62 m — 2.5x the 0.25 m obstacle threshold — which the rover then
+drove over, painting a continuous obstacle trail along its own centreline that
+took `forget_after` (40 integrations, ~2.7 s) to clear. `clearance()` at the
+rover's own pose went to zero.
+
+`dropNullReturns()` is now its own method, called in the sensor frame before
+the transform.
+
+## What that cost, measured
+
+`test/mapping_test.cpp` is new: it renders a range image and unprojects it into
+the OpenCV optical frame the way `mario_bridge.cpp` does, no-returns included,
+then folds it in with the real extrinsic. That is the path `nav_test.cpp` never
+covered — it hands `integrate()` world-frame clouds of nothing but valid
+returns, which is why neither existing suite caught this.
+
+Same test, 120 simulated frames of a 0.6 m/s leg:
+
+| | before | after |
+|---|---|---|
+| frames tripping `REPLAN_OBSTACLE` | 117 / 120 | 0 / 120 |
+| frames where `plan()` found no path | 114 / 120 | 0 / 120 |
+| tightest clearance at the rover's pose | 0.00 m | 1.47 m |
+| occupied cells in the rover's near field | 6 | 0 |
+
+And closed-loop against the live Webots renderer, 90 s per run, real depth
+frames, real terrain, the real `OccupancyMap` and `AStarPlanner`:
+
+| | before | after |
+|---|---|---|
+| `plan()` failures | 354 | 0 |
+| `REPLAN_OBSTACLE` trips | 505 | 0 |
+| ground covered | 4.2 m | 11.4 m |
+
+## Autonomy still does not finish a leg — three more defects
+
+The mapping half is now correct: the map matches the terrain, the boulder faces
+land within 5 cm of truth, and the planner routes between them. The rover still
+never reached waypoint 1. Three separate defects, none of them mapping, written
+up as open issues 1–3 in `KNOWN_ISSUES.md`:
+
+1. **`traverse()` chases a waypoint it has already driven past.** Capture
+   radius is one cell; nothing slows the rover near a waypoint and nothing
+   notices when one ends up behind it. It overshot waypoint 4 by 0.5 m, turned
+   round to fetch it, and ended up facing backwards.
+2. **Every clearance threshold is smaller than the rover.** The circumscribed
+   radius is ~0.53 m; `safety_margin` is 0.35 m and traverse's trip wire is
+   0.30 m. The rover wedged against a boulder at `clearance()` = 0.34 m, above
+   the wire, so `REPLAN_OBSTACLE` never fired and it kept driving into the rock.
+3. **Nothing detects that the rover has stopped.** It sat at one position to
+   the centimetre for 200 s across seven plan/traverse cycles, each ending in a
+   30 s `REPLAN_TIMEOUT` that maps straight back to `PLAN_PATH`.
+
+These are control-loop and tuning changes rather than mapping ones, so they are
+recorded rather than made here.
+
+## What was verified, and how
+
+`stella_vslam` is **not** installed on this machine and neither are rerun,
+librealsense, yasmin or onnxruntime, so the `mario` binary itself still cannot
+be built or run. What was built and run instead:
+
+- `src/nav/*` and all four test suites compiled against **real** grid_map_core
+  2.2.2, PCL 1.14, Eigen 3.4 and the rerun 0.28.1 headers the flake pins — not
+  the stubs the previous pass had to use. Only the arrow-backed serialisation
+  at the bottom of `RecordingStream::log()` was shimmed, and no test calls it.
+- `nav_test`, `planner_test`, `mapping_test`: all pass.
+- `sim/tools/bridge_check` against a live Webots `mars_yard.wbt`: all checks
+  pass, 3407 ORB keypoints, 168347/307200 valid depth pixels.
+- A closed-loop harness driving the real `OccupancyMap` + `AStarPlanner` and
+  the real `traverse()` control law against the live bridge, with the sim's GPS
+  and compass standing in for the SLAM pose. That is where the three defects
+  above were measured.
+
+**Still unverified: stella_vslam itself, and the full `mario` build.** The pose
+this pass fed the map came from the sim's GPS, not from SLAM.
+
+---
+
 # Nav / mapping / SLAM pass — 2026-08-23
 
 Branch `fix/mapping-extrinsic-and-astar`, three commits on top of

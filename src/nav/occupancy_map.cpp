@@ -111,6 +111,14 @@ void OccupancyMap::integrate(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
                              const Eigen::Matrix<double, 4, 4> &T_base_sensor) {
   std::unique_lock<std::shared_mutex> lock(mtx_);
 
+  /* Sensor frame, before anything has moved the points. A no-return is only
+     recognisable while it still sits at the sensor origin: T_base_sensor
+     translates it out to the camera's mount, where it stops comparing equal
+     to zero and starts reading as a solid return 0.40 m in front of the
+     rover. Dropping them after the transform -- which is what this used to do
+     -- is the same as not dropping them at all. */
+  dropNullReturns(cloud);
+
   /* Sensor optical frame -> base FLU. Everything the config describes in
      rover-relative terms happens in here. */
   pcl::transformPointCloud(*cloud, *cloud, T_base_sensor);
@@ -204,13 +212,20 @@ void OccupancyMap::forgetStaleCells() {
   }
 }
 
-void OccupancyMap::filter(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) const {
+void OccupancyMap::dropNullReturns(
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) const {
   /* Depth sensors report "no return" as an exact zero vertex rather than as a
      NaN, and the Webots bridge copies that convention. They are finite, so no
-     PCL filter drops them, and after the transform they all pile up on the
-     sensor origin as a phantom obstacle riding along under the rover. The
-     realsense path drops them at the source; the sim path does not, so catch
-     them here where both go through. */
+     PCL filter drops them. Left in, the whole invalid half of a 640x480 frame
+     -- around 139k points in the sim -- lands on the sensor mount once the
+     extrinsic is applied: an obstacle 0.40 m ahead at the camera's own height
+     of 0.62 m, well past the 0.25 m threshold, that the rover repaints into
+     the world in front of itself every frame and then drives over. A* refuses
+     to leave a start cell walled in like that, so plan() fails outright.
+
+     Must run in the sensor frame. The realsense path drops them at the source
+     as well; the sim path does not, so catch them here where both go
+     through. */
   auto is_null = [](const pcl::PointXYZ &p) {
     return (p.x == 0.0f && p.y == 0.0f && p.z == 0.0f) || !std::isfinite(p.x) ||
            !std::isfinite(p.y) || !std::isfinite(p.z);
@@ -220,7 +235,9 @@ void OccupancyMap::filter(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) const {
       cloud->points.end());
   cloud->width = static_cast<uint32_t>(cloud->points.size());
   cloud->height = 1;
+}
 
+void OccupancyMap::filter(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) const {
   if (cloud->size() < static_cast<size_t>(params_.min_filtering_points)) {
     spdlog::debug("OccupancyMap: {} points is under min_filtering_points ({}), "
                   "skipping filters",

@@ -1,3 +1,132 @@
+# stella_vslam brought up, whole stack run end to end — 2026-08-25 (evening)
+
+On top of the mapping pass below, same branch, nothing pushed. The previous
+pass ended with "**still unverified: stella_vslam itself, and the full `mario`
+build**". Both are now verified, and doing so turned up four defects.
+
+## The dependency tree exists on this machine now
+
+No `nix` here and no root, so the whole tree was built from source into
+`~/mario-deps/prefix`: stella_vslam at the flake's pinned `7b78cc95` with its
+submodules, g2o `20230806_git`, CXSparse, grid_map_core, rerun 0.28.1 (Arrow
+and all), OMPL 1.7.0, librealsense 2.56.3, yasmin, onnxruntime 1.20.1,
+Boost 1.87, cppzmq 4.11, taskflow, asio, cobs-c, and CMake 3.31.6.
+`docs/BUILD_UBUNTU.md` is the recipe, including the two things that need
+working around (g2o wants CXSparse's 32-bit API; Ubuntu's VTK names an
+`MPI::MPI_C` target that nothing declares).
+
+**`mario` links and runs.** That had never happened in this tree.
+
+## Four defects, three of them fixed
+
+1. **`mario` did not link onnxruntime.** `find_package(onnxruntime REQUIRED)`
+   was called and the target never used, so the final link failed with
+   `undefined reference to OrtGetApiBase`. Every library and both test suites
+   built fine, which is how it survived -- nothing but the `mario` target ever
+   reached the link that fails. Fixed.
+
+2. **Two rerun call sites did not compile** -- an iterator pair passed where a
+   `rerun::Collection<uint8_t>` was wanted. Fixed with `Collection::borrow`.
+
+3. **`slamHandle` never called `shutdown()`.** stella_vslam joins its mapping
+   and global-optimisation threads there and nowhere else, so destroying the
+   handle left two joinable `std::thread`s and `std::terminate` fired on every
+   clean exit. Only invisible because `main` never returns (open issue 7).
+   Fixed in the destructor.
+
+4. **stella_vslam cannot track a bit-identical frame, and `RECOVER_SLAM` turns
+   that into a mission abort.** Webots renders a static scene identically down
+   to the byte. Given two identical frames stella initialises a map from the
+   first and loses tracking on the second -- every landmark is already matched,
+   so `search_local_landmarks()` finds no projection candidate. A stationary
+   rover therefore alternates map-created / tracking-lost forever: 680 losses
+   in 45 s. `RECOVER_SLAM` answers a lost pose by *stopping the motors*, which
+   is the one thing that guarantees the duplicate frames keep coming, so mario
+   aborted the mission from a standstill before it had moved.
+
+   The sim side is fixed -- `MarioRover.proto` now gives the camera
+   `noise 0.02`, which a real D435i has anyway. The control-loop half is open
+   issue 1: a recovery that stops the rover cannot recover from anything that
+   needs parallax.
+
+## How good is the pose, and is the map any good built on it
+
+`sim/tools/slam_map_check.cpp` is new. It runs the real chain --
+`StellaBackend` -> `OccupancyMap` -> `AStarPlanner` -- against the live Webots
+bridge, and reads the sim's GPS and compass off the pty purely as truth to
+score against; the truth pose never reaches the map. The same clouds are also
+folded into a second map using the truth pose, which is what separates "SLAM
+drifted" from "the map is wrong regardless of pose". The rock positions in
+`mars_yard.wbt` are known, so the mapped faces can be scored against where the
+rocks really are.
+
+A 26 s leg -- 4.3 m forward, a rotation each way in place, all frames at 15 Hz:
+
+| | |
+|---|---|
+| frames tracked | **394 / 394**, none lost |
+| first pose | frame 1 |
+| position error vs GPS | mean **0.064 m**, max 0.300 m |
+| yaw error vs compass | mean **0.4°**, max 2.0° |
+| clouds integrated | 394 |
+| tightest clearance at the rover's own pose | 1.02 m |
+| `plan()` calls that found no path | **0 / 39** |
+
+So the pose stella hands the map is good to a few centimetres over this
+distance, and mapping on it is indistinguishable from mapping on ground truth:
+every rock face lands at the same cell either way.
+
+## What the map still gets wrong, and it is not SLAM
+
+Mapped rock faces sit 0.2–0.6 m past where the rocks really are -- **in both
+maps**, the SLAM-posed one and the GPS-posed one. That is not calibration and
+not drift. It is `forget_after: 40`: at ~15 integrations a second the map holds
+2.7 s of observations, so what survives to the end of a run is only the sliver
+of each rock still in view. Re-running the identical leg with `forget_after:
+400`:
+
+| Rock | True near face | `forget_after: 40` | `forget_after: 400` |
+|---|---|---|---|
+| rock_a | 5.10 | 5.30 (+0.20) | 5.20 (+0.10) |
+| rock_b | 5.70 | 6.30 (+0.60) | 5.80 (+0.10) |
+| rock_c | 5.50 | unmapped | 5.50 (+0.00) |
+
+Open issue 2. A related one fell out of reading the dumps: through `MapQuery`
+a never-observed cell is indistinguishable from one measured to be flat, so A*
+cannot prefer explored ground even when it has the choice (open issue 3).
+
+## End to end, with everything real
+
+`mario --sim` against `mars_yard.wbt`, with a Rerun viewer and a stub ONNX
+detector standing in for the model the tree does not have: boots, brings up
+stella_vslam, waits for the first grid, loads waypoint 1, plans, and drives
+**7.5 m** to (7.54, −1.27) before wedging against ROCK_B, spinning two 30 s
+`REPLAN_TIMEOUT` cycles against it, and finally losing SLAM with the camera
+pressed into the rock.
+
+That is the same wall the previous pass hit at the same place, and it confirms
+open issues 4, 5 and 6 (waypoint overshoot, clearance thresholds smaller than
+the rover, no stall detection) with real SLAM in the loop rather than the sim's
+GPS standing in for it. Those are still the three things between this rover and
+a finished leg.
+
+## Everything that was run
+
+| | |
+|---|---|
+| `ctest` (fsm, nav, mapping, planner) | 4/4 pass, both Debug and optimised |
+| `sim/tools/bridge_check` against live Webots | all pass, 3595 ORB keypoints, 168347/307200 valid depth |
+| `sim/tools/slam_map_check` (new) | all pass, numbers above |
+| `serial_test` against the bridge pty | writes drive frames, reads GPS fixes back |
+| `utils_test` | zmq publish/subscribe round trip |
+| `slam_test`, `pid_test` | start, then block on a RealSense that is not attached |
+| `mario --sim` end to end | above |
+
+Nothing here has been run on hardware, and `sensor.offset` is still the sim
+mast (open issue 8).
+
+---
+
 # Mapping fix and autonomy check — 2026-08-25
 
 On top of the 2026-08-23 pass below. Branch `fix/mapping-extrinsic-and-astar`,

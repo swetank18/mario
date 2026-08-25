@@ -6,7 +6,72 @@ tracked in the out-of-scope list in `tweaks/REFACTOR_NAV.md`.
 
 ## Open
 
-### 1. `traverse()` chases a waypoint it has already driven past
+### 1. stella_vslam cannot track a bit-identical frame, and RECOVER_SLAM makes that fatal
+
+Fixed on the sim side (see below), but the underlying behaviour is worth
+recording because the recovery strategy is what turns it into a dead end.
+
+Webots renders a static scene bit-identically. Feeding stella_vslam two
+identical frames initialises a map from the first and then fails on the
+second: every landmark is already matched, `search_local_landmarks()` reports
+"projection candidate not found", and tracking is declared lost. Measured on a
+stationary rover: a map created on every even frame, tracking lost on every
+odd one, 680 losses in 45 s.
+
+`RECOVER_SLAM` responds by stopping the motors and waiting up to
+`slam_recover_timeout` for tracking to return. For this failure that is the
+one action guaranteed not to help -- a stationary rover keeps producing
+duplicate frames -- so mario went `TRAVERSE_PATH` -> `RECOVER_SLAM` ->
+`MISSION_ABORT` from a standstill, before the mission had begun.
+
+The sim now has camera noise, which restores the property stella is entitled
+to assume of a real sensor. The control-loop half is still open: a recovery
+that stops the rover cannot recover from anything that needs parallax, and a
+real camera that stalls its stream lands in the same place. A recovery that
+rotates slowly in place would fix both.
+
+### 2. The map forgets an obstacle 2.7 s after it leaves the camera
+
+`forget_after: 40` in `sim/config/gridmap_sim.yaml`, at ~15 integrations a
+second, is 2.7 s of memory. With one forward-facing camera on a rover that
+turns, that is short enough that obstacles the rover drove past are gone from
+the map by the time a planner would need them.
+
+Measured against the true rock positions in `mars_yard.wbt`, after the same
+26 s drive:
+
+| Rock | True near face | Mapped, `forget_after: 40` | Mapped, `forget_after: 400` |
+|---|---|---|---|
+| rock_a | x = 5.10 | 5.30 (+0.20) | 5.20 (+0.10) |
+| rock_b | x = 5.70 | 6.30 (+0.60) | 5.80 (+0.10) |
+| rock_c | x = 5.50 | unmapped | 5.50 (+0.00) |
+
+The offsets are not a calibration error: the same clouds folded in with the
+sim's own GPS pose give the same numbers, so this is the map discarding
+observations rather than the pose being wrong. What is left at the end of a
+run is the sliver of each rock still in view, which recedes as the rover
+closes on it.
+
+40 was chosen so a person walking the course could not leave a permanent wall.
+That still matters, but the two cases want separating -- a decay on the
+elevation blend handles the moving obstacle without throwing away static
+geometry.
+
+### 3. A planner cannot tell unexplored ground from ground observed to be flat
+
+`MapQuery` exposes `occupied()`, `clearance()` and `traversal_cost()`. With
+`unknown_is_occupied: false` a never-observed cell answers exactly as a cell
+measured to be flat does: not occupied, zero cost, and it contributes to
+`clearance()` like clear ground. Nothing downstream can distinguish them, so
+A* will happily route a leg through terrain nothing has ever looked at and
+report the same confidence as for ground it has measured.
+
+That is the intended setting -- with one forward-facing camera, refusing
+unknown cells refuses almost everything -- but the planner should be able to
+prefer explored ground when it has the choice, and today it cannot see the
+difference.
+
+### 4. `traverse()` chases a waypoint it has already driven past
 
 Measured in the Webots sim, with the mapping fix in place. `traverse()` treats
 a waypoint as captured only once the rover is within `map.resolution()` of it
@@ -23,7 +88,7 @@ The fix is a "waypoint is behind me" test -- drop it when the vector to it
 falls behind the rover's beam -- plus a progress check, not a bigger capture
 radius.
 
-### 2. Every clearance threshold is smaller than the rover
+### 5. Every clearance threshold is smaller than the rover
 
 `MarioRover.proto` gives a 0.90 x 0.56 m chassis on wheels at y = +/-0.32 with
 radius 0.15 at x = +/-0.30, so the circumscribed radius about the body origin
@@ -44,7 +109,7 @@ into the rock for 200 s and never once reported an obstacle.
 Both numbers want to come from one measured rover radius, not be picked
 independently.
 
-### 3. Nothing detects that the rover has stopped moving
+### 6. Nothing detects that the rover has stopped moving
 
 Following from the two above: the rover sat at (7.53, -1.46) to the centimetre
 for 200 s, across seven `PLAN_PATH` -> `TRAVERSE_PATH` cycles. Each traverse
@@ -53,14 +118,14 @@ straight back to `PLAN_PATH`, which replanned the same path. There is no
 progress check anywhere in the loop and no bound on how many times that cycle
 may repeat, so a stuck rover looks exactly like a slow one, forever.
 
-### 4. The background threads never exit, so `main` never returns
+### 7. The background threads never exit, so `main` never returns
 
 `capture_frame`, `localize` and `mapping` all loop on `while (true)`. Once
 `sm.run()` finishes, the joins at the bottom of `main` block forever, and the
 cleanup below them is unreachable. The mission completes correctly; the process
 just has to be killed.
 
-### 5. There is no committed gridmap config for the real rover
+### 8. There is no committed gridmap config for the real rover
 
 `sim/config/gridmap_sim.yaml` is the only one in the tree, and its
 `sensor.offset` describes the *sim* mast (0.40 m forward, 0.62 m up, taken from
@@ -69,13 +134,69 @@ on the real rover needs that block measured against the real mount, or the
 mapping bug below comes straight back. Anything unset falls back to the
 defaults in `include/nav/params.hpp`, and the default offset is zero.
 
-### 6. `include/yolo.hpp` is dead but still compiled
+### 9. `include/yolo.hpp` is vendored, wired in, and has no model to run
 
-1017 lines of vendored YOLOv8 detector, `#include`d by `src/mario.cpp` and used
-by nothing. Phase 0.2 of `tweaks/REFACTOR_NAV.md` called for deleting it and
-that never happened. Costs compile time, nothing else.
+1017 lines of vendored YOLOv8 detector. Earlier notes here called it dead code;
+it is not -- `main()` constructs a `YOLO8Detector` unconditionally at startup
+and `search_object()` calls `detect()`, so mario will not start without an ONNX
+file to load. Nothing in the tree provides one (`model/` holds only
+`labels.names`, three classes: right, left, cone), and a stock COCO yolov8n is
+the wrong shape for those three labels.
+
+Until a model is trained, `--yolo_model` needs *something* loadable. The runs
+in this pass used a generated stub with the right tensor shapes
+(`[1,3,640,640]` in, `[1,7,8400]` out) that detects nothing, kept outside the
+tree deliberately -- an empty detector committed under `model/` would look like
+a real one. Phase 0.2 of `tweaks/REFACTOR_NAV.md` still wants the vendored
+detector replaced.
 
 ## Fixed
+
+### `mario` did not link onnxruntime, so the binary had never been built
+
+`CMakeLists.txt` called `find_package(onnxruntime REQUIRED)` and then never
+put the target on any link line, while `src/mario.cpp` includes `yolo.hpp` and
+constructs a `YOLO8Detector`. Every configuration of this tree therefore ended
+in `undefined reference to OrtGetApiBase` at the final link. Both test suites
+and every library target built cleanly, which is why it survived: nothing
+except the `mario` target itself ever reached the link step that fails.
+`onnxruntime::onnxruntime` is now in `target_link_libraries(mario ...)`.
+
+### Two rerun call sites did not compile
+
+`StateMachine::search_object()` and `search_aruco()` passed a
+`{begin, end}` iterator pair to `rerun::Image::from_rgb24()`, which takes a
+`rerun::Collection<uint8_t>` and has no such constructor. Now
+`rerun::Collection<uint8_t>::borrow(data, count)`, which is also the
+non-copying spelling.
+
+Both call sites still hand `from_rgb24` an OpenCV **BGR** buffer, so the frames
+in the viewer have red and blue swapped. Cosmetic, left alone.
+
+### `slamHandle` never shut stella_vslam down, so any clean exit aborted
+
+`stella_vslam::system` owns the mapping and global-optimisation threads and
+joins them only in `shutdown()`. Destroying the handle without calling it left
+two joinable `std::thread`s, and `~thread` calls `std::terminate`:
+`terminate called without an active exception`, followed by a core dump, on
+every clean exit path. mario itself never returns from `main` (open issue 7),
+which is the only reason this had not been seen. The destructor now calls
+`shutdown()` unless termination was already requested.
+
+### Webots rendered a static scene bit-identically, and stella cannot track that
+
+See open issue 1 for the mechanism. `sim/protos/MarioRover.proto` now gives the
+Camera `noise 0.02`. Measured on a stationary rover, before and after:
+
+| | before | after |
+|---|---|---|
+| frames tracked | 189 / 378 | 122 / 122 |
+| tracking losses in 45 s | 680 | 0 |
+| position error against the sim's GPS | n/a, never held a pose | 0.000 m mean |
+
+A real D435i has read noise, so this is the sim being made less ideal rather
+than a workaround.
+
 
 ### No-return points were dropped after the extrinsic, so never dropped at all
 

@@ -196,6 +196,7 @@ target_link_libraries(
   mario
   PRIVATE yasmin
           Boost::program_options
+          onnxruntime::onnxruntime
           slam_backend
           slam_stella
           utils

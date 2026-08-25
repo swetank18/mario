@@ -26,6 +26,16 @@ struct slamHandle {
         slam(slam_cfg, vocab_path) {
     slam.startup();
   }
+
+  /* stella_vslam::system owns the mapping and global-optimisation threads and
+     only joins them in shutdown(). Destroying the handle without it leaves
+     two joinable std::threads, and ~thread calls std::terminate: any clean
+     exit path aborts. mario itself never returns from main (its worker
+     threads loop forever), which is why nothing noticed. */
+  ~slamHandle() {
+    if (!slam.terminate_is_requested())
+      slam.shutdown();
+  }
 };
 
 struct slamPose {

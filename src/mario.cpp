@@ -515,8 +515,10 @@ public:
 
     auto img_data = reinterpret_cast<const uint8_t *>(frame.data);
     rec.log("search/frame",
-            rerun::Image::from_rgb24({img_data, img_data + frame.total() * 3},
-                                     {640, 480}));
+            rerun::Image::from_rgb24(
+                rerun::Collection<uint8_t>::borrow(img_data,
+                                                   frame.total() * 3),
+                {640, 480}));
     return !detections.empty();
   }
 
@@ -542,8 +544,10 @@ public:
 
     auto img_data = reinterpret_cast<const uint8_t *>(frame.data);
     rec.log("search/frame",
-            rerun::Image::from_rgb24({img_data, img_data + frame.total() * 3},
-                                     {640, 480}));
+            rerun::Image::from_rgb24(
+                rerun::Collection<uint8_t>::borrow(img_data,
+                                                   frame.total() * 3),
+                {640, 480}));
 
     if (ids.empty())
       return false;

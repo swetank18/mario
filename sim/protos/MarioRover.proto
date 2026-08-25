@@ -99,6 +99,17 @@ PROTO MarioRover [
         fieldOfView IS cameraFov
         near 0.05
         antiAliasing TRUE
+        # Sensor noise, and load-bearing rather than cosmetic. Webots renders a
+        # static scene bit-identically, and stella_vslam cannot track a frame
+        # that duplicates the one it just built its map from: every landmark is
+        # already matched, search_local_landmarks() finds no projection
+        # candidate, and tracking is declared lost. A stationary rover
+        # therefore loses tracking on every second frame, and since
+        # RECOVER_SLAM stops the motors to wait for tracking to return, mario
+        # can never bootstrap -- it aborts the mission from a standstill.
+        # A real D435i always has read noise, so this restores the property
+        # stella is entitled to assume.
+        noise 0.02
       }
       RangeFinder {
         name "range-finder"

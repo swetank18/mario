@@ -171,7 +171,8 @@ int main(int argc, char **argv) {
   void *ctx = zmq_ctx_new();
   void *sub = zmq_socket(ctx, ZMQ_SUB);
   zmq_connect(sub, endpoint.c_str());
-  for (const char *t : {"color_frame", "depth_frame", "timestamp", "pointcloud"})
+  for (const char *t : {"color_frame", "depth_frame", "timestamp", "pointcloud",
+                        "lidar_pointcloud"})
     zmq_setsockopt(sub, ZMQ_SUBSCRIBE, t, strlen(t));
   int rcvtimeo = 5000;
   zmq_setsockopt(sub, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
@@ -180,8 +181,9 @@ int main(int argc, char **argv) {
   std::vector<uint8_t> color;
   std::vector<uint16_t> depth;
   std::vector<float> cloud;
+  std::vector<float> lidar;
   double ts = -1;
-  int wanted = 4;
+  int wanted = 5;
   for (int i = 0; i < 60 && wanted > 0; i++) {
     char topic[64] = {0};
     int tn = zmq_recv(sub, topic, sizeof(topic) - 1, 0);
@@ -196,6 +198,7 @@ int main(int argc, char **argv) {
     else if (t == "depth_frame" && depth.empty()) { depth.resize(n / 2); memcpy(depth.data(), p, n); wanted--; }
     else if (t == "pointcloud" && cloud.empty())  { cloud.resize(n / 4); memcpy(cloud.data(), p, n); wanted--; }
     else if (t == "timestamp" && ts < 0)          { ts = atof(std::string((const char *)p, n).c_str()); wanted--; }
+    else if (t == "lidar_pointcloud" && lidar.empty()) { lidar.resize(n / 4); memcpy(lidar.data(), p, n); wanted--; }
     zmq_msg_close(&body);
   }
 
@@ -286,6 +289,55 @@ int main(int argc, char **argv) {
     if (nb) y_bottom /= nb;
     printf("       mean y at image bottom: %+.3f m (optical frame, +y = down)\n", y_bottom);
     check(nb > 0 && y_bottom > 0, "cloud is in OpenCV optical frame (+y down)");
+  }
+
+  // ------------------------------------------------------------- lidar
+  // The lidar is the one sensor whose frame nothing else in the tree pins
+  // down, so check it against geometry that is known: the rover is on flat
+  // ground with the lidar 0.90 m up, and mars_yard.wbt puts rocks ahead and
+  // open ground behind.
+  printf("\n== zmq: lidar ==\n");
+  if (lidar.empty()) {
+    printf("       no lidar_pointcloud published -- old world or old bridge\n");
+  } else {
+    const size_t lidar_points = lidar.size() / 3;
+    printf("       lidar_pointcloud: %zu points (%zu floats)\n", lidar_points,
+           lidar.size());
+    check(lidar.size() % 3 == 0 && lidar_points > 1000,
+          "lidar_pointcloud is float32 xyz and not trivially small");
+
+    size_t hits = 0, behind = 0, ahead = 0;
+    double ground_sum = 0;
+    size_t ground_n = 0;
+    double max_range = 0;
+    for (size_t i = 0; i < lidar_points; i++) {
+      const double x = lidar[i * 3 + 0], y = lidar[i * 3 + 1],
+                   z = lidar[i * 3 + 2];
+      if (x == 0.0 && y == 0.0 && z == 0.0) continue;   // no return
+      hits++;
+      max_range = std::max(max_range, std::sqrt(x * x + y * y + z * z));
+      if (x < -1.0) behind++;
+      if (x > 1.0) ahead++;
+      // Flat ground a few metres out, away from the rocks at x ~ 6.
+      if (x > 2.0 && x < 4.0 && std::fabs(y) < 0.5) {
+        ground_sum += z;
+        ground_n++;
+      }
+    }
+    printf("       %zu returns, %zu ahead / %zu behind, max range %.1f m\n",
+           hits, ahead, behind, max_range);
+    check(hits > lidar_points / 10, "lidar has returns (>10%% of rays)");
+    check(behind > 100,
+          "lidar sees behind the rover (a full revolution, not a wedge)");
+    if (ground_n) {
+      const double ground_z = ground_sum / ground_n;
+      printf("       mean z of flat ground 2-4 m ahead: %+.3f m "
+             "(mast height is 0.90 m)\n", ground_z);
+      check(std::fabs(ground_z + 0.90) < 0.15,
+            "lidar frame is FLU with z up, origin at the mast");
+    } else {
+      check(false, "found flat ground 2-4 m ahead to measure z against");
+    }
   }
 
   if (frames_only) {

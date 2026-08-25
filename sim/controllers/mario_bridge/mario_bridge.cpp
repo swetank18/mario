@@ -23,8 +23,10 @@
 #include <webots/Compass.hpp>
 #include <webots/GPS.hpp>
 #include <webots/Motor.hpp>
+#include <webots/Lidar.hpp>
 #include <webots/RangeFinder.hpp>
 #include <webots/Robot.hpp>
+#include <webots/Supervisor.hpp>
 
 #include <zmq.h>
 
@@ -153,7 +155,16 @@ static constexpr double LON0 = -110.792;
 static constexpr double ALT0 = 1400.0;
 
 int main(int argc, char **argv) {
-  webots::Robot robot;
+  /* Supervisor rather than Robot purely for movieStartRecording(). The X
+     session here is XWayland, where an X client's window is composited by the
+     Wayland compositor and never lands in the X root framebuffer, so
+     ffmpeg -f x11grab records 1920x1080 of black. Webots rendering its own 3D
+     view straight to a file sidesteps the display server altogether, and it
+     also survives --minimize, which screen capture cannot.
+
+     The rover node needs `supervisor TRUE` for this; with it FALSE the
+     constructor still works and the movie calls are simply refused. */
+  webots::Supervisor robot;
   const int step = (int)robot.getBasicTimeStep();
   const int sensor_period = 4 * step;   // ~15 Hz at basicTimeStep 16
 
@@ -170,6 +181,7 @@ int main(int argc, char **argv) {
   // ------------------------------------------------------------ devices
   webots::Camera *camera = robot.getCamera("camera");
   webots::RangeFinder *range = robot.getRangeFinder("range-finder");
+  webots::Lidar *lidar = robot.getLidar("lidar");
   webots::GPS *gps = robot.getGPS("gps");
   webots::Compass *compass = robot.getCompass("compass");
   if (!camera || !range || !gps || !compass) {
@@ -178,6 +190,23 @@ int main(int argc, char **argv) {
   }
   camera->enable(sensor_period);
   range->enable(sensor_period);
+  /* Optional on purpose: a world built before the lidar landed still runs,
+     it just never publishes the topic. */
+  /* Half the camera's rate, ~7.5 Hz, which is close to a VLP-16's 10 Hz and
+     is as fast as this box can render 5760 rays without dragging the whole
+     sim below realtime. Realtime is not negotiable here: traverse() and
+     approach() take their PID dt from the wall clock, so a sim running at a
+     quarter speed makes every gain meaningless. */
+  const int lidar_period = 2 * sensor_period;
+  if (lidar) {
+    lidar->enable(lidar_period);
+    lidar->enablePointCloud();
+    printf("[bridge] lidar %d x %d layers, fov %.3f rad, range %.1f m\n",
+           lidar->getHorizontalResolution(), lidar->getNumberOfLayers(),
+           lidar->getFov(), lidar->getMaxRange());
+  } else {
+    printf("[bridge] no lidar device on this rover\n");
+  }
   gps->enable(step);
   compass->enable(step);
 
@@ -231,7 +260,18 @@ int main(int argc, char **argv) {
   // ---------------------------------------------------------------- zmq
   void *zmq_ctx = zmq_ctx_new();
   void *pub = zmq_socket(zmq_ctx, ZMQ_PUB);
-  int sndhwm = 4;   // drop stale frames rather than queue them
+  /* High-water mark counts *messages*, not frames, and a message here is one
+     part of one topic. A step publishes colour, depth, timestamp, the depth
+     cloud and -- when it has a fresh scan -- the lidar, which is five topics
+     and ten parts. The old value of 4 was therefore smaller than a single
+     step: the publisher could never hold one complete step for a subscriber
+     that blinked, so it dropped messages from the middle of a step rather
+     than whole steps. That is the mechanism behind the positional-recv
+     desync warned about in sim/README.md, and with the lidar published last
+     it cost most of the scans -- 31 of ~200 arrived.
+     40 is eight whole steps: still bounded, still drops stale data rather
+     than queueing it without limit, but it drops it a step at a time. */
+  int sndhwm = 40;
   zmq_setsockopt(pub, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
   if (zmq_bind(pub, endpoint.c_str()) != 0) {
     fprintf(stderr, "[bridge] zmq_bind %s: %s\n", endpoint.c_str(),
@@ -241,6 +281,24 @@ int main(int argc, char **argv) {
   printf("[bridge] publishing on %s\n", endpoint.c_str());
   fflush(stdout);
 
+  /* ---------------------------------------------------------------- movie
+     Path and duration come from the environment rather than controllerArgs,
+     so a recording can be asked for without editing the world file. */
+  const char *movie_path = getenv("MARIO_BRIDGE_MOVIE");
+  double movie_seconds = 0.0;
+  if (const char *s = getenv("MARIO_BRIDGE_MOVIE_SECONDS"))
+    movie_seconds = atof(s);
+  bool movie_running = false;
+  if (movie_path && *movie_path) {
+    robot.movieStartRecording(movie_path, 1280, 720, 0 /* codec */,
+                              90 /* quality */, 1 /* realtime */,
+                              false /* caption */);
+    movie_running = true;
+    printf("[bridge] recording to %s%s\n", movie_path,
+           movie_seconds > 0 ? "" : " (until the controller exits)");
+    fflush(stdout);
+  }
+
   auto publish = [&](const char *topic, const void *data, size_t len) {
     zmq_send(pub, topic, strlen(topic), ZMQ_SNDMORE | ZMQ_DONTWAIT);
     zmq_send(pub, data, len, ZMQ_DONTWAIT);
@@ -249,11 +307,13 @@ int main(int argc, char **argv) {
   std::vector<uint8_t> bgr((size_t)W * H * 3);
   std::vector<uint16_t> depth_mm((size_t)W * H);
   std::vector<float> cloud((size_t)W * H * 3);
+  std::vector<float> lidar_cloud;
   std::vector<uint8_t> rx;                       // pty byte accumulator
   rx.reserve(4096);
 
   double last_pub = -1e9;
   double last_geo = -1e9;
+  double last_lidar = -1e9;
   long frames = 0;
 
   while (robot.step(step) != -1) {
@@ -377,18 +437,68 @@ int main(int argc, char **argv) {
       }
     }
 
+    /* Lidar, in its own mount frame: x forward, y left, z up, the same FLU
+       convention the rover's base uses, so the extrinsic that carries it into
+       the base frame is a pure translation. Deliberately NOT converted to the
+       camera's optical convention -- the depth cloud is in optical because
+       that is what unprojecting a range image gives you, and pretending the
+       lidar shares that would mean rotating it twice.
+
+       A miss is published as an exact (0,0,0), the same convention the depth
+       cloud and a real RealSense use, so OccupancyMap::dropNullReturns()
+       catches both without knowing which sensor it is looking at. */
+    size_t lidar_points = 0;
+    const bool lidar_fresh = lidar && (now - last_lidar >= lidar_period / 1000.0 - 1e-6);
+    if (lidar_fresh) {
+      last_lidar = now;
+      const webots::LidarPoint *scan = lidar->getPointCloud();
+      const int count = lidar->getNumberOfPoints();
+      lidar_cloud.resize((size_t)count * 3);
+      for (int i = 0; i < count; i++) {
+        const bool ok = std::isfinite(scan[i].x) && std::isfinite(scan[i].y) &&
+                        std::isfinite(scan[i].z);
+        lidar_cloud[i * 3 + 0] = ok ? scan[i].x : 0.0f;
+        lidar_cloud[i * 3 + 1] = ok ? scan[i].y : 0.0f;
+        lidar_cloud[i * 3 + 2] = ok ? scan[i].z : 0.0f;
+        if (ok)
+          lidar_points++;
+      }
+    }
+
     const std::string ts = std::to_string(now);
     publish("color_frame", bgr.data(), bgr.size());
     publish("depth_frame", depth_mm.data(), depth_mm.size() * sizeof(uint16_t));
     publish("timestamp", ts.data(), ts.size());
     publish("pointcloud", cloud.data(), cloud.size() * sizeof(float));
+    /* Only when there is a new scan. Re-publishing the same one would make
+       the map integrate a stale cloud against a pose that has since moved. */
+    if (lidar_fresh)
+      publish("lidar_pointcloud", lidar_cloud.data(),
+              lidar_cloud.size() * sizeof(float));
+
+    if (movie_running && movie_seconds > 0.0 && now >= movie_seconds) {
+      robot.movieStopRecording();
+      movie_running = false;
+      printf("[bridge] movie stopped at t=%.1f\n", now);
+      fflush(stdout);
+    }
 
     if (++frames % 50 == 0) {
       const double *p = gps->getValues();
-      printf("[bridge] t=%.1f frames=%ld pos=(%.2f, %.2f)\n", now, frames, p[0],
-             p[1]);
+      printf("[bridge] t=%.1f frames=%ld pos=(%.2f, %.2f) lidar=%zu pts\n", now,
+             frames, p[0], p[1], lidar_points);
       fflush(stdout);
     }
+  }
+
+  if (movie_running) {
+    robot.movieStopRecording();
+    /* Webots finishes the encode asynchronously; leaving before it is ready
+       truncates the file. */
+    for (int i = 0; i < 400 && !robot.movieIsReady(); i++)
+      robot.step(step);
+    printf("[bridge] movie %s\n", robot.movieFailed() ? "FAILED" : "written");
+    fflush(stdout);
   }
 
   zmq_close(pub);

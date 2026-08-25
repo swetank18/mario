@@ -37,7 +37,7 @@ WorldInfo {
     }
   ]
 }
-Viewpoint {
+DEF VIEWPOINT Viewpoint {
   orientation -0.32 0.30 0.90 1.75
   position -9.0 -7.5 8.5
   follow "mario"
@@ -243,4 +243,5 @@ MarioRover {
   rotation 0 0 1 0
   name "mario"
   controller "mario_bridge"
+  supervisor TRUE   # for movieStartRecording; see sim/record_mission.sh
 }

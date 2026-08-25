@@ -37,6 +37,13 @@ struct MapParams {
      the rover was already standing on. */
   float sensor_offset[3] = {0.0f, 0.0f, 0.0f};
 
+  /* Where the scanning lidar sits, same base FLU frame and same units. Kept
+     separate from sensor_offset because the two mounts differ and because the
+     frames differ: a depth cloud arrives in the camera's optical convention
+     and needs the optical->FLU rotation on top of the mount, while a lidar
+     cloud is already FLU, so its extrinsic is a pure translation. */
+  float lidar_offset[3] = {0.0f, 0.0f, 0.0f};
+
   /* Rough terrain and SLAM z-drift both move the apparent ground plane, and
      the obstacle thresholds are only +/-0.25 m. Re-estimating the local
      ground from each cloud and thresholding relative to it is what
@@ -70,6 +77,21 @@ struct MapParams {
 
 struct PlannerParams {
   double time_to_solve = 1.0;
+  /* The radius of the circle that contains the rover, about its base origin,
+     in metres. MarioRover.proto gives a 0.90 x 0.56 m chassis on wheels at
+     y = +/-0.32 with radius 0.15 at x = +/-0.30, so it is about 0.53 m.
+
+     This exists because the two thresholds that are supposed to keep the
+     rover off rocks -- the planner's safety margin and traverse()'s obstacle
+     trip wire -- used to be picked independently, and both came out smaller
+     than the rover. A* would plan a line whose corners clipped a boulder, and
+     REPLAN_OBSTACLE could not fire until the rover was already in contact:
+     observed wedged against a rock with clearance() reading 0.34 m against a
+     0.30 m wire, driving into it for 200 s without ever reporting an
+     obstacle. Both now derive from this one measured number.
+
+     Measure it on the real chassis, widest point to widest point. */
+  double rover_radius = 0.53;
   /* METRES between the path and the nearest obstacle. The old code compared a
      grid-index count against a literal 0.1, so the padding it actually gave
      you was off by roughly 1/resolution. */

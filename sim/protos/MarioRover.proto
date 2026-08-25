@@ -37,6 +37,9 @@ PROTO MarioRover [
   field SFInt32    cameraHeight    480
   field SFFloat    cameraFov       0.9566279
   field SFFloat    depthMaxRange   40.0     # matches depth_threshold in stellaconf.yaml
+  field SFInt32    lidarLayers     16       # VLP-16 style
+  field SFInt32    lidarResolution 360      # points per layer per revolution (1 deg)
+  field SFFloat    lidarMaxRange   40.0
   field MFNode     payload         []       # e.g. the arm meshes, for looks
 ]
 {
@@ -120,6 +123,30 @@ PROTO MarioRover [
         near 0.05
         minRange 0.10
         maxRange IS depthMaxRange
+      }
+      # 360-degree scanning lidar, on a short mast above the camera so the
+      # chassis does not eat the lower layers. The depth camera sees a 55-degree
+      # wedge in front of the rover and nothing else, which is why the map
+      # forgets an obstacle 2.7 s after driving past it (KNOWN_ISSUES issue 2)
+      # and why the rover wedges on rocks that left its field of view. This
+      # sees all of them, all the time.
+      #
+      # "fixed" rather than "rotating": a fixed lidar returns the whole sphere
+      # of points on every step, which is deterministic and matches how the
+      # occupancy map consumes a cloud. A rotating one would hand out a slice
+      # per step and need de-skewing against the rover's own motion.
+      Lidar {
+        name "lidar"
+        translation 0 0 0.90
+        horizontalResolution IS lidarResolution
+        fieldOfView 6.2831853         # 2*pi, a full revolution
+        verticalFieldOfView 0.5235988 # 30 degrees, VLP-16's spread
+        numberOfLayers IS lidarLayers
+        near 0.10
+        minRange 0.15
+        maxRange IS lidarMaxRange
+        type "fixed"
+        noise 0.005
       }
       GPS {
         name "gps"

@@ -55,6 +55,7 @@ const std::string topic_color = "color_frame";
 const std::string topic_depth = "depth_frame";
 const std::string topic_timestamp = "timestamp";
 const std::string topic_pointcloud = "pointcloud";
+const std::string topic_lidar = "lidar_pointcloud";
 
 struct mapReadySignal {
   std::mutex mtx;
@@ -201,7 +202,7 @@ auto localize(slam::Backend &backend,
 auto mapping(nav::OccupancyMap &occupancy_map,
              utils::SharedLatest<struct slam::Pose> &poseState,
              zmq::socket_t &sub, const rerun::RecordingStream &rec,
-             utils::rs_config realsense_config) -> void {
+             utils::rs_config realsense_config, bool use_lidar) -> void {
 
   struct slam::Pose pose;
   std::vector<zmq::message_t> pointcloud_msg;
@@ -224,11 +225,32 @@ auto mapping(nav::OccupancyMap &occupancy_map,
      obstacle. The 0.40 m of forward offset was missing too, which put every
      rock 40 cm nearer than it really was. */
   Eigen::Affine3d T_base_sensor = Eigen::Affine3d::Identity();
-  T_base_sensor.linear() = utils::T_camera_base.block<3, 3>(0, 0);
-  T_base_sensor.translation() =
-      Eigen::Vector3d(occupancy_map.params().sensor_offset[0],
-                      occupancy_map.params().sensor_offset[1],
-                      occupancy_map.params().sensor_offset[2]);
+  if (use_lidar) {
+    /* A lidar cloud is already in the base FLU convention -- x forward, y
+       left, z up -- so the mount is the whole transform and the rotation
+       stays identity. Applying the optical->FLU rotation here as well would
+       turn the scan on its side. */
+    T_base_sensor.translation() =
+        Eigen::Vector3d(occupancy_map.params().lidar_offset[0],
+                        occupancy_map.params().lidar_offset[1],
+                        occupancy_map.params().lidar_offset[2]);
+    spdlog::info("GridMap: building from the lidar, mount ({:.2f}, {:.2f}, "
+                 "{:.2f})",
+                 T_base_sensor.translation().x(),
+                 T_base_sensor.translation().y(),
+                 T_base_sensor.translation().z());
+  } else {
+    T_base_sensor.linear() = utils::T_camera_base.block<3, 3>(0, 0);
+    T_base_sensor.translation() =
+        Eigen::Vector3d(occupancy_map.params().sensor_offset[0],
+                        occupancy_map.params().sensor_offset[1],
+                        occupancy_map.params().sensor_offset[2]);
+    spdlog::info("GridMap: building from the depth camera, mount ({:.2f}, "
+                 "{:.2f}, {:.2f})",
+                 T_base_sensor.translation().x(),
+                 T_base_sensor.translation().y(),
+                 T_base_sensor.translation().z());
+  }
 
   Eigen::Affine3d T_world_base = Eigen::Affine3d::Identity();
 
@@ -417,6 +439,39 @@ public:
     spdlog::info(std::format("LED: {}", name));
   }
 
+  /* Escape manoeuvre for a rover that has stopped making progress. Backing
+     off and turning is the only thing that changes what the camera can see,
+     and therefore the only thing that can change the plan -- RECOVER_OBSTACLE
+     pauses for half a second and replans from the same pose against the same
+     map, which is how the rover spent 200 s replanning the same path into the
+     same rock. */
+  auto escape_stall() -> bool {
+    spdlog::warn("State Machine: no progress -- backing off");
+    const auto reverse_until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+    while (std::chrono::steady_clock::now() < reverse_until) {
+      tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(-0.25f, 0.0f);
+      if (serial::write_msg<struct tarzan::tarzan_msg>(
+              serial, msg, tarzan::TARZAN_MSG_LEN) !=
+          serial::Error::WriteSuccess)
+        return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto turn_until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+    while (std::chrono::steady_clock::now() < turn_until) {
+      tarzan::tarzan_msg msg =
+          tarzan::get_tarzan_msg(0.0f, (float)(drive_cmd.angular_z * 0.6));
+      if (serial::write_msg<struct tarzan::tarzan_msg>(
+              serial, msg, tarzan::TARZAN_MSG_LEN) !=
+          serial::Error::WriteSuccess)
+        return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    stop_motors();
+    return true;
+  }
+
   auto traverse() -> TraverseResult {
     if (!current_path || current_path->empty()) {
       spdlog::warn("State Machine: Path is empty or invalid");
@@ -430,11 +485,40 @@ public:
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
     size_t waypoint_idx = 1;
-    double linear_x = drive_cmd.linear_x, angular_z = 0.0;
+    const double max_linear = drive_cmd.linear_x;
+    double angular_z = 0.0;
     /* The configured maximum, held separately. Clamping against angular_z
        itself uses the previous output as this iteration's bound, which
        ratchets the command down to zero over a few waypoints. */
     const double max_angular = drive_cmd.angular_z;
+
+    /* A waypoint counts as captured inside this, rather than inside one cell.
+       The pose updates at 10 Hz and the rover covers 6 cm between updates at
+       0.6 m/s, so a 10 cm capture radius is a coin toss -- miss it and the
+       rover turns round to fetch a waypoint it has already driven through.
+       Observed: waypoint 4 overshot by 0.5 m, a U-turn, and the rest of the
+       leg driven backwards. */
+    const double capture_radius = std::max(2.5 * map_.resolution(), 0.25);
+    /* Beyond the capture radius, a waypoint behind the rover's beam is still
+       done with: chasing it means turning round. This is the test the capture
+       radius cannot do on its own, and it is what actually stops the U-turn. */
+    const double behind_slack = 1.5;
+    /* Stop driving forward and turn on the spot past this heading error.
+       Driving and turning at once is what turns a heading error into an arc
+       that overshoots the next waypoint. */
+    const double turn_in_place_error = 0.6;
+    /* Ease off within this distance of the waypoint being chased. */
+    const double slow_radius = 0.6;
+
+    /* Stall detection. The rover sat at one position to the centimetre for
+       200 s across seven plan/traverse cycles, each ending in a 30 s
+       REPLAN_TIMEOUT that mapped straight back to PLAN_PATH -- a stuck rover
+       looked exactly like a slow one, forever. */
+    const double stall_distance = 0.08;
+    const auto stall_window = std::chrono::seconds(4);
+    auto stall_epoch = std::chrono::steady_clock::now();
+    double stall_x = 0.0, stall_y = 0.0;
+    bool stall_ref_valid = false;
 
     while (waypoint_idx < path.size()) {
       if (std::chrono::steady_clock::now() > deadline)
@@ -454,16 +538,70 @@ public:
          here instead — otherwise this spins and floods the serial port */
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-      /* Same three-cell trip wire as before, asked in metres now that the
-         map answers in them. */
-      if (map_.clearance(pose.x, pose.y) < 3.0 * map_.resolution())
+      /* The trip wire, in metres, from the same measured rover radius the
+         planner keeps its paths clear by. It used to be three grid cells --
+         0.30 m against a rover 0.53 m in radius -- so the rover could be in
+         contact with a rock and still be told it had clearance. */
+      if (map_.clearance(pose.x, pose.y) < planner_params_.rover_radius) {
+        /* Tripping the wire leaves traverse(), and RECOVER_OBSTACLE pauses for
+           half a second and plans again from the same pose against the same
+           map -- which produces the same path, which trips the wire again.
+           51 recoveries in one 5-minute run, none of them going anywhere.
+
+           The stall detector below cannot see it, because every trip resets
+           the loop it lives in. So the count is kept on the object instead:
+           three trips inside the same 0.4 m and the rover backs out rather
+           than replanning into the same rock a fourth time. */
+        if (std::hypot(pose.x - last_trip_x_, pose.y - last_trip_y_) < 0.4)
+          obstacle_trips_++;
+        else
+          obstacle_trips_ = 1;
+        last_trip_x_ = pose.x;
+        last_trip_y_ = pose.y;
+
+        if (obstacle_trips_ >= 3) {
+          spdlog::warn("State Machine: {} obstacle trips at ({:.2f}, {:.2f}) "
+                       "-- backing out instead of replanning",
+                       obstacle_trips_, pose.x, pose.y);
+          obstacle_trips_ = 0;
+          if (!escape_stall())
+            return TraverseResult::FAULT_SERIAL;
+        }
         return TraverseResult::REPLAN_OBSTACLE;
+      }
+
+      /* Has the rover actually moved? Anything that stops it -- wedged on a
+         rock, a wheel dug in, a command that never reached the motors -- looks
+         the same from here, and all of them need the same answer. */
+      if (!stall_ref_valid) {
+        stall_x = pose.x;
+        stall_y = pose.y;
+        stall_epoch = std::chrono::steady_clock::now();
+        stall_ref_valid = true;
+      } else if (std::hypot(pose.x - stall_x, pose.y - stall_y) >
+                 stall_distance) {
+        stall_x = pose.x;
+        stall_y = pose.y;
+        stall_epoch = std::chrono::steady_clock::now();
+        /* Moving again, so whatever the last trip was about is behind us. */
+        obstacle_trips_ = 0;
+      } else if (std::chrono::steady_clock::now() - stall_epoch >
+                 stall_window) {
+        if (!escape_stall())
+          return TraverseResult::FAULT_SERIAL;
+        return TraverseResult::REPLAN_OBSTACLE;
+      }
 
       double dx = path[waypoint_idx].x - pose.x;
       double dy = path[waypoint_idx].y - pose.y;
       double distance = std::sqrt(dx * dx + dy * dy);
 
-      if (distance < map_.resolution()) {
+      /* Captured, or already passed. The dot product is the rover's heading
+         against the direction to the waypoint: negative means it is behind
+         the beam, and no amount of driving forward will reach it. */
+      const double ahead = std::cos(pose.yaw) * dx + std::sin(pose.yaw) * dy;
+      if (distance < capture_radius ||
+          (ahead < 0.0 && distance < behind_slack)) {
         waypoint_idx++;
         continue;
       }
@@ -483,7 +621,19 @@ public:
             -max_angular, max_angular);
       previous = now;
 
-      tarzan::tarzan_msg msg = tarzan::get_tarzan_msg(linear_x, angular_z);
+      /* Speed follows the heading error and the distance left: turn on the
+         spot while badly aimed, ease off approaching the waypoint, full speed
+         only when pointed at it with room ahead. A constant forward command
+         is what made every heading correction an overshooting arc. */
+      double linear_x = 0.0;
+      if (std::abs(angular_error) < turn_in_place_error) {
+        const double aim = 1.0 - std::abs(angular_error) / turn_in_place_error;
+        const double approach = std::clamp(distance / slow_radius, 0.3, 1.0);
+        linear_x = max_linear * aim * approach;
+      }
+
+      tarzan::tarzan_msg msg =
+          tarzan::get_tarzan_msg((float)linear_x, (float)angular_z);
       serial::Error err = serial::write_msg<struct tarzan::tarzan_msg>(
           serial, msg, tarzan::TARZAN_MSG_LEN);
       if (err != serial::Error::WriteSuccess)
@@ -673,13 +823,29 @@ public:
 
     auto path = planner_.plan({pose.x, pose.y}, {local_x, local_y});
     if (!path) {
-      spdlog::warn("State Machine: no path to local goal");
+      /* Which end refused matters and the old line did not say. A* will not
+         leave a start cell inside safety_margin of an obstacle, and it will
+         not accept a goal in one either, and the two want completely
+         different answers -- back out, versus pick a different goal. */
+      spdlog::warn("State Machine: no path from ({:.2f}, {:.2f}) "
+                   "[clearance {:.2f} m, occupied={}] to ({:.2f}, {:.2f}) "
+                   "[clearance {:.2f} m, occupied={}], margin {:.2f} m",
+                   pose.x, pose.y, map_.clearance(pose.x, pose.y),
+                   map_.occupied(pose.x, pose.y), local_x, local_y,
+                   map_.clearance(local_x, local_y),
+                   map_.occupied(local_x, local_y),
+                   planner_params_.safety_margin);
       return PlanResult::FAULT;
     }
 
     current_path = std::move(path);
     return PlanResult::PATH_FOUND;
   }
+
+  /* Obstacle trips that produced no movement, and where the last one was.
+     traverse() returns on every trip, so this cannot live in its loop. */
+  int obstacle_trips_ = 0;
+  double last_trip_x_ = 1e9, last_trip_y_ = 1e9;
 
 public:
   nav::OccupancyMap &map_;
@@ -744,7 +910,11 @@ int main(int argc, char *argv[]) {
       "slam_config", po::value<std::string>()->default_value("stellaconf.yaml"),
       "stella_vslam camera config")(
       "slam_vocab", po::value<std::string>()->default_value("orb_vocab.fbow"),
-      "stella_vslam ORB vocabulary");
+      "stella_vslam ORB vocabulary")(
+      "cloud_source", po::value<std::string>()->default_value("depth"),
+      "which cloud the occupancy map is built from: 'depth' (the RGB-D "
+      "camera's 55-degree wedge) or 'lidar' (the 360-degree scanner). The "
+      "lidar needs sensor.lidar_offset in the gridmap config.");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -765,6 +935,14 @@ int main(int argc, char *argv[]) {
       return -1;
     }
   }
+
+  const std::string cloud_source = vm["cloud_source"].as<std::string>();
+  if (cloud_source != "depth" && cloud_source != "lidar") {
+    spdlog::error("--cloud_source must be 'depth' or 'lidar', got {}",
+                  cloud_source);
+    return -1;
+  }
+  const bool use_lidar = cloud_source == "lidar";
 
   /* In sim the Webots mario_bridge controller owns the PUB socket, so frames
      have to cross a process boundary -- inproc:// cannot reach it. */
@@ -884,7 +1062,8 @@ int main(int argc, char *argv[]) {
 
   try {
     mapping_sub.connect(zmq_endpoint);
-    mapping_sub.set(zmq::sockopt::subscribe, topic_pointcloud);
+    mapping_sub.set(zmq::sockopt::subscribe,
+                    use_lidar ? topic_lidar : topic_pointcloud);
   } catch (zmq::error_t &e) {
     spdlog::error(e.what());
   }
@@ -909,7 +1088,7 @@ int main(int argc, char *argv[]) {
                               realsense_config);
   std::thread mapping_thread(mapping, std::ref(occupancy_map),
                              std::ref(poseState), std::ref(mapping_sub),
-                             std::ref(rec), realsense_config);
+                             std::ref(rec), realsense_config, use_lidar);
 
   /* PARSE GNSS WAYPOINTS */
   {

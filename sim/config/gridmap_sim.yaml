@@ -47,6 +47,13 @@ sensor:
     x: 0.40
     y: 0.0
     z: 0.62
+  # The scanning lidar, on the mast above the camera (MarioRover.proto mounts
+  # it at "0 0 0.90"). Its cloud arrives already in the base FLU convention, so
+  # unlike the depth camera this is a pure translation with no rotation.
+  lidar_offset:
+    x: 0.0
+    y: 0.0
+    z: 0.90
 
 # Re-measure the ground plane from each cloud and threshold relative to it,
 # rather than trusting z = 0 to be the ground. Rough terrain and SLAM z-drift
@@ -78,9 +85,17 @@ filters:
 planner:
   # Only the sampling planner (OmplPlanner) spends this; A* is not timed.
   time_to_solve: 1.0
-  # METRES from the path to the nearest obstacle. Was effectively a count of
-  # grid cells before, so check this one against the rover's real footprint.
-  safety_margin: 0.35
+  # The circle that contains the rover, about its base origin, in metres.
+  # MarioRover.proto: 0.90 x 0.56 m chassis, wheels at y = +/-0.32 with radius
+  # 0.15 at x = +/-0.30. Measure it on the real chassis before a field run.
+  # traverse()'s obstacle trip wire comes from this too, so the planner and the
+  # control loop cannot disagree about how big the rover is.
+  rover_radius: 0.53
+  # METRES from the path to the nearest obstacle. Must be at least
+  # rover_radius or the path clips boulders the chassis cannot clear;
+  # loadPlannerParams() raises it if it is not. The 7 cm over is the margin
+  # for pose error -- SLAM runs about 6 cm against ground truth in the sim.
+  safety_margin: 0.60
   goal_tolerance: 0.15
   # How hard to push the path away from obstacles once it already clears them
   # by safety_margin. 0 gives the shortest route regardless of how close it

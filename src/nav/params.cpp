@@ -2,6 +2,8 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <spdlog/spdlog.h>
+
 #include "nav/params.hpp"
 
 namespace nav {
@@ -49,6 +51,12 @@ MapParams loadMapParams(const std::string &filename) {
     read(offset, "y", params.sensor_offset[1]);
     read(offset, "z", params.sensor_offset[2]);
   }
+  if (sensor && sensor["lidar_offset"]) {
+    const YAML::Node offset = sensor["lidar_offset"];
+    read(offset, "x", params.lidar_offset[0]);
+    read(offset, "y", params.lidar_offset[1]);
+    read(offset, "z", params.lidar_offset[2]);
+  }
 
   const YAML::Node ground = config["ground"];
   read(ground, "estimate", params.estimate_ground);
@@ -83,7 +91,19 @@ PlannerParams loadPlannerParams(const std::string &filename) {
 
   const YAML::Node planner = config["planner"];
   read(planner, "time_to_solve", params.time_to_solve);
+  read(planner, "rover_radius", params.rover_radius);
   read(planner, "safety_margin", params.safety_margin);
+
+  /* A margin narrower than the rover is not a margin. Raising it here rather
+     than trusting the config means one forgotten key cannot put the planner
+     back to routing paths that clip boulders. */
+  if (params.safety_margin < params.rover_radius) {
+    spdlog::warn("Planner: safety_margin {:.2f} m is inside the rover's own "
+                 "{:.2f} m radius; raising it. A* would otherwise plan a path "
+                 "the chassis cannot fit through.",
+                 params.safety_margin, params.rover_radius);
+    params.safety_margin = params.rover_radius;
+  }
   read(planner, "goal_tolerance", params.goal_tolerance);
   read(planner, "obstacle_cost_weight", params.obstacle_cost_weight);
   read(planner, "terrain_cost_weight", params.terrain_cost_weight);

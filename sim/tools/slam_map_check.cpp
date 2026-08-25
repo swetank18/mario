@@ -41,7 +41,10 @@
 
 #include <Eigen/Dense>
 #include <pcl/point_cloud.h>
+#include <pcl/common/transforms.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
 #include <rerun.hpp>
 #include <spdlog/spdlog.h>
 #include <zmq.h>
@@ -156,6 +159,14 @@ struct Link {
   void *ctx = nullptr, *sub = nullptr;
   std::vector<uint8_t> rx;
 
+  /* One message of pushback. A step's messages are only recognisable as a
+     step by watching for a topic repeating, which means reading one message
+     too many; that message belongs to the next step and must not be thrown
+     away. */
+  std::string pending_topic;
+  std::vector<uint8_t> pending_body;
+  bool has_pending = false;
+
   bool open(const std::string &pty, const std::string &endpoint) {
     fd = ::open(pty.c_str(), O_RDWR | O_NOCTTY);
     if (fd < 0) {
@@ -175,11 +186,15 @@ struct Link {
       std::perror("zmq_connect");
       return false;
     }
-    for (const char *topic :
-         {"color_frame", "depth_frame", "timestamp", "pointcloud"})
+    for (const char *topic : {"color_frame", "depth_frame", "timestamp",
+                              "pointcloud", "lidar_pointcloud"})
       zmq_setsockopt(sub, ZMQ_SUBSCRIBE, topic, std::strlen(topic));
     int rcvtimeo = 3000;
     zmq_setsockopt(sub, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
+    /* Match the bridge's send-side mark: a subscriber whose own queue is
+       shorter than a step drops parts of steps for the same reason. */
+    int rcvhwm = 40;
+    zmq_setsockopt(sub, ZMQ_RCVHWM, &rcvhwm, sizeof(rcvhwm));
     return true;
   }
 
@@ -235,13 +250,26 @@ struct FrameSet {
   std::vector<uint8_t> color;  // BGR8 640x480
   std::vector<uint8_t> depth;  // uint16 mm 640x480
   std::vector<float> cloud;    // xyz float32, OpenCV optical frame
+  std::vector<float> lidar;    // xyz float32, base FLU frame at the mast
   double timestamp = 0.0;
   bool has_color = false, has_depth = false, has_cloud = false, has_ts = false;
+  bool has_lidar = false;
+  bool want_lidar = false;
 
+  /* The depth cloud is published on every step and the lidar only when it has
+     a fresh scan, so the depth cloud is what marks the end of a step's
+     messages -- waiting on the lidar would stall on the steps it skips.
+     pump() picks up a scan that follows, without blocking for one.
+
+     The lidar deliberately does not gate a frame: mario runs localize() and
+     mapping() as separate threads on separate sockets, so SLAM sees every
+     camera frame whichever cloud the map is built from. */
   bool complete() const {
-    return has_color && has_depth && has_cloud && has_ts;
+    return has_color && has_depth && has_ts && has_cloud;
   }
-  void clear() { has_color = has_depth = has_cloud = has_ts = false; }
+  void clear() {
+    has_color = has_depth = has_cloud = has_ts = has_lidar = false;
+  }
 };
 
 // Dispatch on the topic name rather than on arrival order. mario's localize()
@@ -252,27 +280,19 @@ struct FrameSet {
 static int trace_topics = 0;
 
 static bool pump(Link &link, FrameSet &fs) {
-  for (int i = 0; i < 64; i++) {
-    char topic[64] = {0};
-    const int tn = zmq_recv(link.sub, topic, sizeof(topic) - 1, 0);
-    if (tn < 0)
-      return false;
-    zmq_msg_t body;
-    zmq_msg_init(&body);
-    if (zmq_msg_recv(&body, link.sub, 0) < 0) {
-      zmq_msg_close(&body);
-      return false;
-    }
-    const std::string t(topic, tn);
-    if (trace_topics > 0) {
-      std::printf("%s ", t.c_str());
-      if (--trace_topics == 0)
-        std::printf("\n");
-      std::fflush(stdout);
-    }
-    const auto *data = static_cast<const uint8_t *>(zmq_msg_data(&body));
-    const size_t len = zmq_msg_size(&body);
+  /* Assemble one published step. The bridge sends a fixed sequence --
+     color_frame, depth_frame, timestamp, pointcloud, and lidar_pointcloud on
+     the steps it has a fresh scan -- so a step is over when a topic repeats.
+     Reading only until the topics SLAM needs have arrived drops the lidar
+     scan every time, because it is published last; that is what an earlier
+     version of this did, and it saw 21 scans out of 195.
 
+     Dispatch is by topic name rather than by arrival order. mario's
+     localize() does three positional recv_multipart calls instead, which is
+     known issue 3 in sim/README.md: one dropped message desynchronises it
+     permanently, and a harness that inherited the same assumption could not
+     tell a SLAM failure from a stream that had slipped. */
+  auto store = [&fs](const std::string &t, const uint8_t *data, size_t len) {
     if (t == "color_frame" && len == 640u * 480u * 3u) {
       fs.color.assign(data, data + len);
       fs.has_color = true;
@@ -286,13 +306,60 @@ static bool pump(Link &link, FrameSet &fs) {
       fs.cloud.resize(len / sizeof(float));
       std::memcpy(fs.cloud.data(), data, len);
       fs.has_cloud = true;
+    } else if (t == "lidar_pointcloud") {
+      fs.lidar.resize(len / sizeof(float));
+      std::memcpy(fs.lidar.data(), data, len);
+      fs.has_lidar = true;
     }
-    zmq_msg_close(&body);
+  };
+  auto already_have = [&fs](const std::string &t) {
+    return (t == "color_frame" && fs.has_color) ||
+           (t == "depth_frame" && fs.has_depth) ||
+           (t == "timestamp" && fs.has_ts) ||
+           (t == "pointcloud" && fs.has_cloud) ||
+           (t == "lidar_pointcloud" && fs.has_lidar);
+  };
 
-    if (fs.complete())
-      return true;
+  if (link.has_pending) {
+    link.has_pending = false;
+    store(link.pending_topic, link.pending_body.data(),
+          link.pending_body.size());
   }
-  return false;
+
+  for (int i = 0; i < 64; i++) {
+    char topic[64] = {0};
+    const int tn = zmq_recv(link.sub, topic, sizeof(topic) - 1, 0);
+    if (tn < 0)
+      return fs.complete();
+    zmq_msg_t body;
+    zmq_msg_init(&body);
+    if (zmq_msg_recv(&body, link.sub, 0) < 0) {
+      zmq_msg_close(&body);
+      return fs.complete();
+    }
+    const std::string t(topic, tn);
+    if (trace_topics > 0) {
+      std::printf("%s ", t.c_str());
+      if (--trace_topics == 0)
+        std::printf("\n");
+      std::fflush(stdout);
+    }
+    const auto *data = static_cast<const uint8_t *>(zmq_msg_data(&body));
+    const size_t len = zmq_msg_size(&body);
+
+    if (already_have(t)) {
+      // The next step has begun. Hold this one back and hand over what we have.
+      link.pending_topic = t;
+      link.pending_body.assign(data, data + len);
+      link.has_pending = true;
+      zmq_msg_close(&body);
+      return fs.complete();
+    }
+
+    store(t, data, len);
+    zmq_msg_close(&body);
+  }
+  return fs.complete();
 }
 
 // --------------------------------------------------------------- map scoring
@@ -377,6 +444,8 @@ int main(int argc, char **argv) {
   bool drive = true;
   bool dump = false;
   bool verbose = false;
+  bool use_lidar = false;
+  std::string pcd_prefix;
 
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
@@ -403,6 +472,10 @@ int main(int argc, char **argv) {
       trace_topics = std::stoi(next());
     else if (a == "--verbose")
       verbose = true;
+    else if (a == "--lidar")
+      use_lidar = true;
+    else if (a == "--save-pcd")
+      pcd_prefix = next();
     else {
       std::fprintf(stderr, "unknown option: %s\n", a.c_str());
       return 2;
@@ -429,12 +502,22 @@ int main(int argc, char **argv) {
   nav::OccupancyMap map_truth(map_params);
   nav::AStarPlanner planner(map_slam, planner_params);
 
-  // The mount, exactly as src/mario.cpp builds it.
+  // The mount, exactly as src/mario.cpp builds it. A lidar cloud is already
+  // FLU so its extrinsic is a pure translation; a depth cloud arrives in the
+  // camera's optical frame and needs the rotation as well.
   Eigen::Affine3d T_base_sensor = Eigen::Affine3d::Identity();
-  T_base_sensor.linear() = utils::T_camera_base.block<3, 3>(0, 0);
-  T_base_sensor.translation() = Eigen::Vector3d(map_params.sensor_offset[0],
-                                                map_params.sensor_offset[1],
-                                                map_params.sensor_offset[2]);
+  if (use_lidar) {
+    T_base_sensor.translation() = Eigen::Vector3d(map_params.lidar_offset[0],
+                                                  map_params.lidar_offset[1],
+                                                  map_params.lidar_offset[2]);
+  } else {
+    T_base_sensor.linear() = utils::T_camera_base.block<3, 3>(0, 0);
+    T_base_sensor.translation() = Eigen::Vector3d(map_params.sensor_offset[0],
+                                                  map_params.sensor_offset[1],
+                                                  map_params.sensor_offset[2]);
+  }
+  std::printf("       cloud source: %s\n",
+              use_lidar ? "lidar (360 degrees)" : "depth camera (55 degrees)");
 
   const auto rec = rerun::RecordingStream("mario slam_map_check");
   const bool logging = !rrd.empty();
@@ -482,6 +565,7 @@ int main(int argc, char **argv) {
   };
 
   FrameSet fs;
+  fs.want_lidar = use_lidar;
   geodetic fix{};
   bool have_fix = false;
 
@@ -504,6 +588,15 @@ int main(int argc, char **argv) {
   std::printf("\n== live run: %.0f s against the bridge ==\n", seconds);
 
   auto cloud = pcl::PointCloud<pcl::PointXYZ>::Ptr(
+      new pcl::PointCloud<pcl::PointXYZ>());
+
+  /* Every scan carried into the world frame on the SLAM pose and kept. This
+     is the 3D record of the run -- the occupancy grid is a 2.5D projection of
+     it that forgets cells, and once forgotten there is nothing to go back to.
+     Voxelled at the end rather than per frame, so nothing is lost early. */
+  pcl::PointCloud<pcl::PointXYZ>::Ptr world_cloud(
+      new pcl::PointCloud<pcl::PointXYZ>());
+  pcl::PointCloud<pcl::PointXYZ>::Ptr first_scan(
       new pcl::PointCloud<pcl::PointXYZ>());
 
   while (elapsed() < seconds) {
@@ -567,19 +660,44 @@ int main(int argc, char **argv) {
     }
 
     // The cloud, folded in exactly the way mapping() does it.
-    const size_t num_points = fs.cloud.size() / 3;
+    if (use_lidar ? !fs.has_lidar : !fs.has_cloud) {
+      /* No new scan this frame -- SLAM has had it, the map has nothing to
+         add. Counted as tracked, not as integrated. */
+      continue;
+    }
+    const std::vector<float> &src = use_lidar ? fs.lidar : fs.cloud;
+    const size_t num_points = src.size() / 3;
     cloud->width = static_cast<uint32_t>(num_points);
     cloud->height = 1;
     cloud->is_dense = false;
     cloud->points.resize(num_points);
     for (size_t i = 0; i < num_points; ++i) {
-      cloud->points[i].x = fs.cloud[3 * i + 0];
-      cloud->points[i].y = fs.cloud[3 * i + 1];
-      cloud->points[i].z = fs.cloud[3 * i + 2];
+      cloud->points[i].x = src[3 * i + 0];
+      cloud->points[i].y = src[3 * i + 1];
+      cloud->points[i].z = src[3 * i + 2];
     }
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_raw(
         new pcl::PointCloud<pcl::PointXYZ>(*cloud));
+
+    if (!pcd_prefix.empty()) {
+      if (first_scan->empty())
+        *first_scan = *cloud_raw;   // one raw scan, in the sensor's own frame
+      /* Sensor -> base -> world, the same two transforms integrate() applies,
+         minus the filtering: this is the record, not the map. */
+      Eigen::Affine3d T_world_sensor = Eigen::Affine3d::Identity();
+      T_world_sensor.linear() =
+          Eigen::AngleAxisd(pose.yaw, Eigen::Vector3d::UnitZ())
+              .toRotationMatrix();
+      T_world_sensor.translation() = Eigen::Vector3d(pose.x, pose.y, pose.z);
+      T_world_sensor = T_world_sensor * T_base_sensor;
+
+      pcl::PointCloud<pcl::PointXYZ> stamped;
+      pcl::transformPointCloud(*cloud_raw, stamped, T_world_sensor);
+      for (const auto &p : stamped.points)
+        if (std::isfinite(p.x) && (p.x != 0.0f || p.y != 0.0f || p.z != 0.0f))
+          world_cloud->points.push_back(p);
+    }
 
     Eigen::Affine3d T_world_base = Eigen::Affine3d::Identity();
     T_world_base.linear() =
@@ -619,7 +737,10 @@ int main(int argc, char **argv) {
        and a planner correctly refusing an occupied goal is not a failure. The
        route to this one has to thread past rock_a and rock_c, which is the
        behaviour worth testing. */
-    if (tracked % 10 == 0) {
+    /* Keyed off integrations, not tracked frames: with the lidar the map only
+       changes when a scan arrives, and keying off tracked frames meant the
+       planner was almost never exercised on the frames that had one. */
+    if (integrated % 10 == 0) {
       plan_calls++;
       const auto path =
           planner.plan({pose.x, pose.y}, {kGoal.first, kGoal.second});
@@ -727,6 +848,37 @@ int main(int argc, char **argv) {
 
   std::printf("       occupied cells within 1 m of the rover: %d\n",
               occupiedNear(map_slam, slam_x, slam_y, 1.0, res));
+
+  if (!pcd_prefix.empty()) {
+    std::printf("\n== point cloud export ==\n");
+    first_scan->width = first_scan->points.size();
+    first_scan->height = 1;
+    first_scan->is_dense = false;
+    const std::string raw = pcd_prefix + "_scan_sensor_frame.pcd";
+    pcl::io::savePCDFileBinary(raw, *first_scan);
+    std::printf("       %s: one raw scan, %zu points, sensor frame\n",
+                raw.c_str(), first_scan->points.size());
+
+    world_cloud->width = world_cloud->points.size();
+    world_cloud->height = 1;
+    world_cloud->is_dense = false;
+    const size_t raw_total = world_cloud->points.size();
+    const std::string full = pcd_prefix + "_accumulated_world_frame.pcd";
+    pcl::io::savePCDFileBinary(full, *world_cloud);
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr voxelled(
+        new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::VoxelGrid<pcl::PointXYZ> voxel;
+    voxel.setInputCloud(world_cloud);
+    voxel.setLeafSize(0.05f, 0.05f, 0.05f);
+    voxel.filter(*voxelled);
+    const std::string thin = pcd_prefix + "_accumulated_voxel5cm.pcd";
+    pcl::io::savePCDFileBinary(thin, *voxelled);
+    std::printf("       %s: every scan in the world frame, %zu points\n",
+                full.c_str(), raw_total);
+    std::printf("       %s: same, 5 cm voxels, %zu points\n", thin.c_str(),
+                voxelled->points.size());
+  }
 
   if (dump) {
     std::printf("\n== occupancy, SLAM pose vs truth pose ==\n");

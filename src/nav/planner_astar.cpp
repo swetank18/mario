@@ -60,11 +60,30 @@ std::optional<Path> AStarPlanner::plan(const Waypoint &start,
     return std::hypot(a.x - b.x, a.y - b.y);
   };
 
-  /* Room enough for the rover, and not so close to an obstacle that the twist
-     controller's overshoot puts it into one. */
+  /* Seeding the start cell is not enough on its own: clearance is a smooth
+     distance field, so a rover standing 0.42 m from a rock has neighbours at
+     roughly 0.42 m too, every one of them fails a 0.60 m margin, and the
+     search dies on its first expansion having gone nowhere. Observed exactly
+     that -- "no path from (16.03, 2.56) [clearance 0.42 m] to (22.22, 6.97)
+     [clearance 1.84 m]" -- repeated until the FSM aborted the mission, with
+     open ground in every direction.
+
+     So near the start the rover may move through anything at least as clear
+     as where it already stands, and no tighter. It cannot make its situation
+     worse, it can always leave, and past the escape radius the full margin
+     applies again. Refusing to plan does not make a rover safer; it strands
+     it somewhere it could have reversed out of. */
+  const double start_clearance = map_.clearance(start.x, start.y);
+  const double escape_margin = std::min(params_.safety_margin, start_clearance);
+  const double escape_radius = 2.0 * params_.safety_margin;
+
   auto passable = [&](const Waypoint &w) {
-    return !map_.occupied(w.x, w.y) &&
-           map_.clearance(w.x, w.y) >= params_.safety_margin;
+    if (map_.occupied(w.x, w.y))
+      return false;
+    const double room = map_.clearance(w.x, w.y);
+    if (room >= params_.safety_margin)
+      return true;
+    return distance(w, start) <= escape_radius && room >= escape_margin;
   };
 
   const int start_index = cell_of(start);
@@ -84,7 +103,12 @@ std::optional<Path> AStarPlanner::plan(const Waypoint &start,
 
   /* The start cell is seeded whatever passable() says about it: the rover is
      already there, and refusing to plan out of a tight spot is how it gets
-     stuck against a rock it can still reverse away from. */
+     stuck against a rock it can still reverse away from. The escape margin
+     above is what carries that concession out to its neighbours. */
+  if (start_clearance < params_.safety_margin)
+    spdlog::debug("AStarPlanner: start has {:.2f} m of room against a {:.2f} m "
+                  "margin; planning out on an escape margin of {:.2f} m",
+                  start_clearance, params_.safety_margin, escape_margin);
   cost[start_index] = 0.0;
   open.push({distance(start, target), start_index});
 

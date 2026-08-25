@@ -187,6 +187,17 @@ if(BUILD_TESTS)
 
 endif()
 
+# slam_map_check -- the mapping pipeline driven by stella_vslam against a live
+# Webots bridge, scored against the sim's own GPS and compass. Not a ctest
+# test: it needs a running simulator. sim/tools/bridge_check and fsm_drive
+# deliberately build without the dependency tree; this one cannot, because the
+# whole point of it is to run the real StellaBackend into the real
+# OccupancyMap.
+add_executable(slam_map_check ${CMAKE_SOURCE_DIR}/sim/tools/slam_map_check.cpp)
+target_include_directories(slam_map_check PRIVATE include)
+target_link_libraries(slam_map_check PRIVATE slam_stella nav_map nav_planner
+                                             utils cppzmq)
+
 add_executable(mario ${CMAKE_SOURCE_DIR}/src/mario.cpp)
 
 target_include_directories(mario PRIVATE yasmin slam_backend slam_stella serial

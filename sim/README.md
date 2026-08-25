@@ -17,6 +17,7 @@ two and nothing else:
    COBS geodetic_msg <- GPS+Compass   depth_frame  uint16 mm
                      |                timestamp    ascii double, seconds
                      |                pointcloud   float32 xyz, optical frame
+                     |                lidar_pointcloud float32 xyz, base FLU
                      v                          v
                             mario --sim
              stella_vslam / grid_map / OMPL / YOLO / ArUco
@@ -31,7 +32,7 @@ boundary.
 
 | Path | What |
 |---|---|
-| `protos/MarioRover.proto` | 4-wheel skid-steer rover: camera, range-finder, GPS, compass |
+| `protos/MarioRover.proto` | 4-wheel skid-steer rover: camera, range-finder, lidar, GPS, compass |
 | `protos/ArucoMarker.proto` | DICT_4X4_50 marker board on a post |
 | `worlds/mars_yard.wbt` | Textured terrain, rocks, marker, cone |
 | `controllers/mario_bridge/` | The hardware-impersonating bridge |
@@ -40,6 +41,9 @@ boundary.
 | `config/gnss_waypoints.txt` | One waypoint of each type |
 | `gen_textures.py` | Regenerates the ground/rock/marker textures |
 | `tools/bridge_check.cpp` | Standalone bridge validator (libzmq + OpenCV only) |
+| `tools/slam_map_check.cpp` | stella_vslam -> occupancy map -> A*, scored against the sim's GPS |
+| `tools/record_stream.py` | Records the rover's camera + depth + lidar to an mp4 |
+| `record_mission.sh` | Runs and records the full mario mission |
 | `worlds/test_marker.wbt` | Rover parked 3 m in front of the marker |
 | `run_sim.sh` | Launches Webots, waits for the pty, starts mario |
 
@@ -145,36 +149,63 @@ of the marker, for checking detection without driving the whole mission.
 
 ## Known issues in the surrounding code
 
-These are pre-existing and were found while wiring the sim up. The first one
-still limits how far the rover can get.
+Kept in `KNOWN_ISSUES.md` at the repo root rather than duplicated here -- the
+list in this file went stale once the map started recentring on the rover and
+the control-loop defects were fixed. The two that most affect running the sim:
 
-1. **The grid map never follows the rover** (`src/nav/occupancy_map.cpp`).
-   `setGeometry` builds a fixed `dim` box centred on the SLAM origin and
-   nothing ever calls `GridMap::move()`, but `plan()` works in absolute SLAM
-   coordinates — `start` is `pose.x, pose.y` and the goal is that pose plus an
-   offset. Once the rover is further than `x/2` (10 m with
-   `config/gridmap_sim.yaml`) from where SLAM started, it drives off its own
-   map. `AStarPlanner` now clamps an off-map goal back onto the grid instead of
-   failing outright, so the mission no longer stops dead at the first leg — but
-   the rover is still planning inside a box it has left, and waypoint 1 is
-   14 m out. The fix is entirely on the mapping side now: recentre the map on
-   the current pose as it updates. Planners read their bounds back through
-   `MapQuery::bounds()` on every call, so nothing on the planning side needs
-   to know.
+- **No YOLO model in the tree.** `--yolo_model` has no default and `model/`
+  holds only `labels.names` (`right`, `left`, `cone`). mario constructs the
+  detector unconditionally at startup, so it needs *some* loadable ONNX file.
+  Without a trained one the `GPS_OBJECT` waypoint runs out its 60 s search and
+  takes the partial-credit path to `WAYPOINT_REACHED` -- still a valid FSM
+  path, just not a detection test.
 
-2. **No YOLO model in the tree.** `--yolo_model` has no default and
-   `model/` contains only `labels.names` (`right`, `left`, `cone`). Without a
-   model the `GPS_OBJECT` waypoint just runs out its 60 s search timeout and
-   takes the partial-credit path to `WAYPOINT_REACHED` — still a valid FSM
-   path, just not a detection test.
+- **`localize()` assumes strict message ordering** (`src/mario.cpp`). Three
+  positional `recv_multipart` calls treated as colour, depth, timestamp. The
+  bridge publishes in that order, and its high-water mark is now large enough
+  to hold whole steps rather than dropping messages from the middle of one,
+  but the assumption is still fragile. `sim/tools/slam_map_check.cpp`
+  dispatches on the topic name instead and will not desync.
 
-3. **`localize()` assumes strict message ordering** (`src/mario.cpp:156`).
-   It does three positional `recv_multipart` calls and treats them as colour,
-   depth, timestamp. A single dropped message desynchronises the stream
-   permanently. The bridge publishes in the right order and caps its send
-   high-water mark at 4 to limit the blast radius, but the assumption is
-   fragile.
+## The lidar
 
-4. **GNSS parser has no comment support** (`src/mario.cpp:1097`). The `#`
-   lines in `config/gnss_waypoints.txt` each log a "Skipping malformed GNSS
-   line" warning. Harmless, but noisy.
+A 360-degree scanner on a 0.90 m mast: 16 layers x 360 points, 30-degree
+vertical spread, 40 m range, published as `lidar_pointcloud` at 7.5 Hz -- half
+the camera rate, which is about a VLP-16's 10 Hz and as fast as this machine
+renders 5760 rays without dragging the sim below realtime. Realtime is not
+optional: `traverse()` and `approach()` take their PID dt from the wall clock.
+
+Its cloud is already in the base FLU convention (x forward, y left, z up), so
+unlike the depth cloud its extrinsic is a pure translation --
+`sensor.lidar_offset` in the gridmap config. Build the map from it with
+`mario --cloud_source lidar`; `depth` remains the default.
+
+Two things to know:
+
+- **It is blind within 3.4 m.** The lowest beam does not reach the ground
+  until 0.90 / tan(15 deg), so there is a hole around the rover -- visible as
+  the black ellipse in `artifacts/lidar_map.png`. That is the range the
+  obstacle trip wire cares about, so the depth camera still has a job.
+- **`bridge_check` verifies its frame** against known geometry: flat ground
+  2-4 m ahead must come back at z = -0.90.
+
+## Recording a run
+
+Screen capture does not work here: the session is XWayland, an X client's
+window is composited by the Wayland compositor and never reaches the X root
+framebuffer, and `ffmpeg -f x11grab -i :0` records a black rectangle.
+
+Two things that do work:
+
+```sh
+# 1. the rover's own view -- camera, colourised depth, live lidar scatter
+sim/tools/record_stream.py out.mp4 --seconds 340
+
+# 2. Webots' own recorder, straight to a file, no display server involved
+MARIO_BRIDGE_MOVIE=/path/out.mp4 MARIO_BRIDGE_MOVIE_SECONDS=60 \
+  webots --minimize --batch --mode=realtime sim/worlds/mars_yard.wbt
+```
+
+The second needs `supervisor TRUE` on the rover node, which `mars_yard.wbt`
+now sets. Aiming its Viewpoint is fiddly -- Webots' orientation convention is
+not the obvious one -- so the first is what `sim/record_mission.sh` uses.

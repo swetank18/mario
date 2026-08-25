@@ -6,151 +6,125 @@ tracked in the out-of-scope list in `tweaks/REFACTOR_NAV.md`.
 
 ## Open
 
-### 1. stella_vslam cannot track a bit-identical frame, and RECOVER_SLAM makes that fatal
+### 1. The lidar is blind within 3.4 m of the rover
 
-Fixed on the sim side (see below), but the underlying behaviour is worth
-recording because the recovery strategy is what turns it into a dead end.
+The scanner sits 0.90 m up with a 30-degree vertical spread, so its lowest
+beam does not reach the ground until 0.90 / tan(15 deg) = 3.4 m out. Inside
+that radius there is nothing but the few returns off anything tall enough to
+rise into the beam. It shows up as a black ellipse around the rover in
+`artifacts/lidar_map.png`.
 
-Webots renders a static scene bit-identically. Feeding stella_vslam two
-identical frames initialises a map from the first and then fails on the
-second: every landmark is already matched, `search_local_landmarks()` reports
-"projection candidate not found", and tracking is declared lost. Measured on a
-stationary rover: a map created on every even frame, tracking lost on every
-odd one, 680 losses in 45 s.
+That is normal for a VLP-16-class scanner and it is exactly the range at which
+`traverse()`'s obstacle trip wire operates -- the wire asks about clearance
+within 0.53 m of the rover, which the lidar physically cannot measure. Today
+the map is built from one source or the other (`--cloud_source`), so choosing
+the lidar buys 360-degree coverage at the cost of the near field, and choosing
+the depth camera buys the near field at the cost of everything behind. The two
+want fusing rather than choosing: lidar beyond 3.5 m, depth camera inside it.
 
-`RECOVER_SLAM` responds by stopping the motors and waiting up to
-`slam_recover_timeout` for tracking to return. For this failure that is the
-one action guaranteed not to help -- a stationary rover keeps producing
-duplicate frames -- so mario went `TRAVERSE_PATH` -> `RECOVER_SLAM` ->
-`MISSION_ABORT` from a standstill, before the mission had begun.
+### 2. `RECOVER_SLAM` stops the rover, which is the one thing that cannot help
 
-The sim now has camera noise, which restores the property stella is entitled
-to assume of a real sensor. The control-loop half is still open: a recovery
-that stops the rover cannot recover from anything that needs parallax, and a
-real camera that stalls its stream lands in the same place. A recovery that
-rotates slowly in place would fix both.
+Unchanged from the last pass, and still the reason a duplicate-frame stall is
+fatal. stella_vslam needs parallax to re-initialise, and the recovery
+strategy's first act is to remove all of it. A recovery that rotates slowly on
+the spot would fix both this and the ordinary loss-of-tracking case.
 
-### 2. The map forgets an obstacle 2.7 s after it leaves the camera
+### 3. The map forgets an obstacle a few seconds after it leaves the sensor
 
-`forget_after: 40` in `sim/config/gridmap_sim.yaml`, at ~15 integrations a
-second, is 2.7 s of memory. With one forward-facing camera on a rover that
-turns, that is short enough that obstacles the rover drove past are gone from
-the map by the time a planner would need them.
+`forget_after: 40` is 2.7 s at the depth camera's 15 Hz and 5.3 s at the
+lidar's 7.5 Hz. With 360-degree coverage this matters far less than it did --
+the lidar keeps seeing what the camera lost -- but the underlying behaviour is
+the same, and the measured effect on mapped rock faces is in the last pass's
+notes. A decay on the elevation blend would handle a person walking the course
+without discarding static geometry.
 
-Measured against the true rock positions in `mars_yard.wbt`, after the same
-26 s drive:
+### 4. A planner cannot tell unexplored ground from ground observed to be flat
 
-| Rock | True near face | Mapped, `forget_after: 40` | Mapped, `forget_after: 400` |
-|---|---|---|---|
-| rock_a | x = 5.10 | 5.30 (+0.20) | 5.20 (+0.10) |
-| rock_b | x = 5.70 | 6.30 (+0.60) | 5.80 (+0.10) |
-| rock_c | x = 5.50 | unmapped | 5.50 (+0.00) |
+Unchanged. With `unknown_is_occupied: false` a never-observed cell answers
+`occupied()`, `clearance()` and `traversal_cost()` exactly as a cell measured
+to be flat does, so A* cannot prefer explored ground even when it has the
+choice.
 
-The offsets are not a calibration error: the same clouds folded in with the
-sim's own GPS pose give the same numbers, so this is the map discarding
-observations rather than the pose being wrong. What is left at the end of a
-run is the sliver of each rock still in view, which recedes as the rover
-closes on it.
+### 5. `PlanResult::FAULT` is routed to `FAULT_SERIAL`
 
-40 was chosen so a person walking the course could not leave a permanent wall.
-That still matters, but the two cases want separating -- a decay on the
-elevation blend handles the moving obstacle without throwing away static
-geometry.
+`plan()` returns `FAULT` both when the serial link fails and when A* finds no
+path, and `fsm.hpp` maps that to `FAULT_SERIAL`, which retries five times and
+then aborts the mission. Those are different failures wanting different
+answers -- a planning failure should back off, widen the goal, or wait for the
+map to fill in, none of which involve the serial port. Observed aborting a
+mission over a planning failure with the link perfectly healthy.
 
-### 3. A planner cannot tell unexplored ground from ground observed to be flat
-
-`MapQuery` exposes `occupied()`, `clearance()` and `traversal_cost()`. With
-`unknown_is_occupied: false` a never-observed cell answers exactly as a cell
-measured to be flat does: not occupied, zero cost, and it contributes to
-`clearance()` like clear ground. Nothing downstream can distinguish them, so
-A* will happily route a leg through terrain nothing has ever looked at and
-report the same confidence as for ground it has measured.
-
-That is the intended setting -- with one forward-facing camera, refusing
-unknown cells refuses almost everything -- but the planner should be able to
-prefer explored ground when it has the choice, and today it cannot see the
-difference.
-
-### 4. `traverse()` chases a waypoint it has already driven past
-
-Measured in the Webots sim, with the mapping fix in place. `traverse()` treats
-a waypoint as captured only once the rover is within `map.resolution()` of it
--- one cell, 10 cm -- and it re-aims from a pose that updates at 10 Hz while
-driving at 0.6 m/s. Nothing slows the rover near a waypoint and nothing notices
-when one ends up behind it, so a single overshoot turns into a U-turn.
-
-On the first leg of `mars_yard.wbt` the rover captured waypoints 1 to 3
-cleanly, overshot waypoint 4 at (6.35, -2.65) by 0.5 m, turned around to come
-back for it, and drove into ROCK_B. Closest it ever came to that waypoint was
-0.52 m; it spent the rest of the run pointing backwards at yaw = 3.14.
-
-The fix is a "waypoint is behind me" test -- drop it when the vector to it
-falls behind the rover's beam -- plus a progress check, not a bigger capture
-radius.
-
-### 5. Every clearance threshold is smaller than the rover
-
-`MarioRover.proto` gives a 0.90 x 0.56 m chassis on wheels at y = +/-0.32 with
-radius 0.15 at x = +/-0.30, so the circumscribed radius about the body origin
-is about **0.53 m**. Both thresholds that are supposed to keep the rover off
-rocks are measured from that same origin and are well inside it:
-
-| Threshold | Value | Where |
-|---|---|---|
-| `planner.safety_margin` | 0.35 m | `sim/config/gridmap_sim.yaml`, `AStarPlanner::passable` |
-| traverse trip wire | 0.30 m | `3.0 * map_.resolution()` in `traverse()` |
-
-So A* will happily plan a line whose corners clip a boulder, and
-`REPLAN_OBSTACLE` cannot fire until the rover is already in contact. Observed
-directly: the rover wedged against ROCK_B with `clearance()` reading 0.34 m,
-which is above the 0.30 m wire, so `traverse()` kept commanding it forward
-into the rock for 200 s and never once reported an obstacle.
-
-Both numbers want to come from one measured rover radius, not be picked
-independently.
-
-### 6. Nothing detects that the rover has stopped moving
-
-Following from the two above: the rover sat at (7.53, -1.46) to the centimetre
-for 200 s, across seven `PLAN_PATH` -> `TRAVERSE_PATH` cycles. Each traverse
-ran its full 30 s deadline and returned `REPLAN_TIMEOUT`, which `fsm.hpp` maps
-straight back to `PLAN_PATH`, which replanned the same path. There is no
-progress check anywhere in the loop and no bound on how many times that cycle
-may repeat, so a stuck rover looks exactly like a slow one, forever.
-
-### 7. The background threads never exit, so `main` never returns
+### 6. The background threads never exit, so `main` never returns
 
 `capture_frame`, `localize` and `mapping` all loop on `while (true)`. Once
-`sm.run()` finishes, the joins at the bottom of `main` block forever, and the
-cleanup below them is unreachable. The mission completes correctly; the process
-just has to be killed.
+`sm.run()` finishes the joins at the bottom of `main` block forever. The
+mission completes correctly and logs "mission complete"; the process then has
+to be killed. `sim/record_mission.sh` watches the log rather than the process
+for exactly this reason.
 
-### 8. There is no committed gridmap config for the real rover
+### 7. There is no committed gridmap config for the real rover
 
-`sim/config/gridmap_sim.yaml` is the only one in the tree, and its
-`sensor.offset` describes the *sim* mast (0.40 m forward, 0.62 m up, taken from
-`sim/protos/MarioRover.proto`). Whatever YAML gets passed as `--gridmap_config`
-on the real rover needs that block measured against the real mount, or the
-mapping bug below comes straight back. Anything unset falls back to the
-defaults in `include/nav/params.hpp`, and the default offset is zero.
+`sim/config/gridmap_sim.yaml` is still the only one in the tree, and its
+`sensor.offset`, `sensor.lidar_offset` and `planner.rover_radius` all describe
+the *sim* rover. Measure all three against the real chassis.
 
-### 9. `include/yolo.hpp` is vendored, wired in, and has no model to run
+### 8. `include/yolo.hpp` is vendored, wired in, and has no model to run
 
-1017 lines of vendored YOLOv8 detector. Earlier notes here called it dead code;
-it is not -- `main()` constructs a `YOLO8Detector` unconditionally at startup
-and `search_object()` calls `detect()`, so mario will not start without an ONNX
-file to load. Nothing in the tree provides one (`model/` holds only
-`labels.names`, three classes: right, left, cone), and a stock COCO yolov8n is
-the wrong shape for those three labels.
-
-Until a model is trained, `--yolo_model` needs *something* loadable. The runs
-in this pass used a generated stub with the right tensor shapes
-(`[1,3,640,640]` in, `[1,7,8400]` out) that detects nothing, kept outside the
-tree deliberately -- an empty detector committed under `model/` would look like
-a real one. Phase 0.2 of `tweaks/REFACTOR_NAV.md` still wants the vendored
-detector replaced.
+`main()` constructs a `YOLO8Detector` unconditionally, so mario will not start
+without a loadable ONNX file, and nothing in the tree provides one -- `model/`
+holds only `labels.names` with three classes (right, left, cone). A stock COCO
+yolov8n is the wrong shape for those labels. The runs in these passes used a
+generated stub with the right tensor shapes that detects nothing, kept
+deliberately outside the tree.
 
 ## Fixed
+
+### Every clearance threshold was smaller than the rover
+
+The planner's `safety_margin` (0.35 m) and traverse()'s trip wire
+(`3.0 * resolution` = 0.30 m) were picked independently and both came out
+inside the rover's own 0.53 m circumscribed radius, so A* would plan a line
+whose corners clipped a boulder and `REPLAN_OBSTACLE` could not fire until the
+rover was already in contact. Both now derive from one measured
+`planner.rover_radius`, and `loadPlannerParams()` raises a margin narrower
+than the rover rather than trusting the config.
+
+### A* would not plan its way out of a tight spot
+
+Seeding the start cell was not enough. Clearance is a smooth distance field,
+so a rover standing 0.42 m from a rock has neighbours at 0.42 m too, every one
+of them failed the 0.60 m margin, and the search died on its first expansion.
+The mission aborted over it with open ground in every direction:
+"no path from (16.03, 2.56) [clearance 0.42 m] to (22.22, 6.97) [clearance
+1.84 m]". Near the start the rover may now move through anything at least as
+clear as where it already stands, and no tighter; past twice the margin the
+full margin applies again.
+
+### `traverse()` chased a waypoint it had already driven past
+
+Capture radius was one cell against a pose that updates at 10 Hz while driving
+at 0.6 m/s, and nothing noticed a waypoint that ended up behind the rover. It
+overshot, turned round, and drove the rest of the leg backwards. Now: a
+capture radius of 0.25 m, a "behind my beam" test on the dot product, forward
+speed that falls off with heading error and with distance to the waypoint, and
+a full stop to turn on the spot past 0.6 rad of error.
+
+### Nothing detected that the rover had stopped
+
+The rover sat at one position for 200 s across seven plan/traverse cycles.
+`traverse()` now keeps a reference position and backs out -- 1.2 s of reverse
+and 0.9 s of turn -- after 4 s without 8 cm of movement.
+
+### Obstacle recovery livelocked
+
+The stall detector could not see the commonest stall, because tripping the
+obstacle wire *leaves* `traverse()` and `RECOVER_OBSTACLE` pauses for half a
+second and replans from the same pose against the same map, producing the same
+path. 51 recoveries in one 5-minute run, none of them going anywhere. The trip
+count now lives on the state machine rather than in the traverse loop: three
+trips inside the same 0.4 m and the rover backs out instead of replanning.
+Same course, after: 14 recoveries and the mission finished.
+
 
 ### `mario` did not link onnxruntime, so the binary had never been built
 

@@ -1,3 +1,128 @@
+# LiDAR, a finished mission, and a video — 2026-08-26
+
+Same branch, nothing pushed. The previous pass got stella_vslam running and
+the binary building; this one adds a 360-degree lidar, fixes the five defects
+that stopped an autonomous leg, and records the result.
+
+## The rover finishes the course
+
+`mario --sim` against `mars_yard.wbt`, real stella_vslam, real lidar occupancy
+map, real A*, real FSM:
+
+```
+BOOT -> WAIT_MAP_READY -> LOAD_WAYPOINT -> PLAN_PATH -> TRAVERSE_PATH
+     -> WAYPOINT_REACHED  (waypoint 1, GPS_ONLY, 14 m out)
+     -> SEARCH_TARGET -> APPROACH_TARGET -> WAYPOINT_REACHED  (waypoint 2, ArUco id 1)
+     -> WAYPOINT_REACHED  (waypoint 3, GPS_OBJECT)
+     -> MISSION_DONE
+```
+
+**5 min 32 s, all three waypoints, 14 obstacle recoveries.** The ArUco marker
+was detected and approached from the rendered camera frames. Before this pass
+the rover had never got past waypoint 1: it wedged against ROCK_B at
+(7.54, -1.27) and sat there.
+
+## What was stopping it — five defects
+
+1. **Every clearance threshold was smaller than the rover.** `safety_margin`
+   0.35 m and traverse's trip wire 0.30 m, against a chassis whose
+   circumscribed radius is 0.53 m. Both now come from one measured
+   `planner.rover_radius`, and `loadPlannerParams()` refuses a margin narrower
+   than the rover.
+
+2. **A\* would not plan its way out of a tight spot.** Seeding the start cell
+   is not enough when clearance is a smooth field: a rover 0.42 m from a rock
+   has neighbours at 0.42 m, all of which fail a 0.60 m margin, so the search
+   died on its first expansion. The mission aborted over it with open ground
+   in every direction. Near the start the rover may now move through anything
+   at least as clear as where it already stands.
+
+3. **`traverse()` chased waypoints it had driven past.** Capture radius 0.25 m,
+   a "behind my beam" test, speed that falls off with heading error and
+   distance, and turning on the spot past 0.6 rad.
+
+4. **Nothing detected a stopped rover.** Now backs out after 4 s without 8 cm.
+
+5. **Obstacle recovery livelocked.** Tripping the wire leaves `traverse()`, so
+   the stall detector never saw the commonest stall, and RECOVER_OBSTACLE
+   replanned the same path into the same rock: 51 recoveries in one run, none
+   of them going anywhere. The trip count now lives on the state machine.
+   Same course after: 14.
+
+## The lidar
+
+`MarioRover.proto` gains a 360-degree scanner on a 0.90 m mast: 16 layers,
+360 points each, 30-degree vertical spread, 40 m range, 7.5 Hz. The bridge
+publishes it as `lidar_pointcloud` in the base FLU frame, so unlike the depth
+cloud its extrinsic is a pure translation. `mario --cloud_source lidar` builds
+the occupancy map from it; `depth` is still the default and unchanged.
+
+Mapping accuracy, measured against the true rock positions in the world file
+over a 60 s drive, with the sim's GPS as an independent check on the pose:
+
+| | |
+|---|---|
+| frames tracked | **907 / 907**, none lost |
+| position error vs GPS | mean **0.051 m** |
+| yaw error vs compass | mean **0.3 deg** |
+| scans integrated | 454 |
+| rock_a face | true 5.10, mapped **5.20** |
+| rock_b face | true 5.70, mapped **5.80** |
+| rock_c face | true 5.50, mapped **5.50** |
+
+Every rock lands within one 10 cm cell, and rock_c -- which the depth camera
+never mapped at all, because it sits outside its 55-degree wedge -- is now
+mapped exactly.
+
+Two things the lidar does not fix, both now recorded as open issues: it is
+**blind within 3.4 m** (its lowest beam does not reach the ground until then),
+which is precisely the range the obstacle trip wire cares about; and it costs
+enough render time that the first attempt dragged the sim to a quarter of
+realtime, which makes every PID gain meaningless. 360 points per layer at half
+the camera's rate holds realtime.
+
+Raising the bridge's ZMQ high-water mark was necessary and is worth knowing
+about: it was 4 *messages*, and a step publishes five topics, so the publisher
+could never hold one complete step for a subscriber that blinked. It dropped
+messages from the middle of a step rather than whole steps -- which is the
+mechanism behind the positional-recv desync warned about in sim/README.md, and
+it cost most of the lidar scans (31 of ~200 arrived). Now 40, eight whole
+steps.
+
+## Artefacts
+
+`artifacts/` (untracked -- they are large and reproducible):
+
+| File | What |
+|---|---|
+| `mission_run.mp4` | the full 5.5-minute mission: rover camera, colourised depth, live lidar scatter |
+| `lidar_accumulated_world_frame.pcd` | 2.6 M points, every scan carried into the world frame on the SLAM pose |
+| `lidar_accumulated_voxel5cm.pcd` | the same at 5 cm voxels, 159 k points |
+| `lidar_scan_sensor_frame.pcd` | one raw 5760-point scan, sensor frame |
+| `lidar_map.png` | top-down render of the cloud against the true rock footprints |
+
+The video is recorded off the ZMQ bus by `sim/tools/record_stream.py` rather
+than by screen capture. This machine runs XWayland, where an X client's window
+is composited by the Wayland compositor and never reaches the X root
+framebuffer, so `ffmpeg -f x11grab` records a black rectangle. Webots' own
+`movieStartRecording()` does work and is wired up behind `MARIO_BRIDGE_MOVIE`,
+but aiming its Viewpoint proved fiddly enough that the rover's own camera --
+the input the decisions were actually made from -- is the better record.
+
+## Verified
+
+| | |
+|---|---|
+| `ctest` (fsm, nav, mapping, planner) | 4/4, both Debug and optimised |
+| `bridge_check` incl. new lidar checks | all pass; frame verified FLU at the mast |
+| `slam_map_check --lidar` | all pass, numbers above |
+| `mario --sim --cloud_source lidar` | MISSION_DONE, 3/3 waypoints |
+
+Still nothing on hardware, and `sensor.offset`, `sensor.lidar_offset` and
+`planner.rover_radius` all still describe the sim rover.
+
+---
+
 # stella_vslam brought up, whole stack run end to end — 2026-08-25 (evening)
 
 On top of the mapping pass below, same branch, nothing pushed. The previous

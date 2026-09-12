@@ -208,6 +208,7 @@ target_link_libraries(
   PRIVATE yasmin
           Boost::program_options
           onnxruntime::onnxruntime
+          yaml-cpp
           slam_backend
           slam_stella
           utils

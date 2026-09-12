@@ -93,6 +93,7 @@ stdbuf -o0 "$MARIO_BIN" \
   --gnss "$SIM_DIR/config/gnss_waypoints.txt" \
   --rerun_ip "$RERUN_IP" \
   --cloud_source "$CLOUD_SOURCE" \
+  --marker_size 0.336 \
   --p 1.2 --i 0.0 --d 0.05 \
   --linear 0.6 --angular 1.0 \
   --yolo_model "${YOLO_MODEL:-$REPO_DIR/model/yolov8n.onnx}" \

@@ -34,6 +34,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_set>
+#include <yaml-cpp/yaml.h>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 
@@ -64,6 +65,11 @@ struct mapReadySignal {
   std::condition_variable cv;
   bool flag = false;
 } map_sync;
+
+/* How close to a post URC wants the rover to finish. approach() aims to stop
+   inside this by a margin (approach_stop_m); this is the hard line it will
+   not let a target slip out of the frame beyond. */
+constexpr float kUrcStopDistanceM = 2.0f;
 
 /* function to capture & publish realsense frames */
 auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
@@ -354,6 +360,27 @@ auto mapping(nav::OccupancyMap &occupancy_map,
       map_sync.cv.notify_all();
     }
   }
+}
+
+/* The newest complete message on a SUB socket, discarding everything queued
+   behind it. The search and approach loops read the camera only while they
+   run, so by the time a waypoint is reached the socket holds every frame
+   published since the last search -- hundreds of them -- and approach() would
+   count thirty stale marker-less frames as "lost the target" before it saw a
+   single current one. Blocks for one message if the queue is empty. */
+static auto recv_latest(zmq::socket_t &sub, std::vector<zmq::message_t> &msgs)
+    -> bool {
+  msgs.clear();
+  if (!zmq::recv_multipart(sub, std::back_inserter(msgs)).has_value())
+    return false;
+  std::vector<zmq::message_t> newer;
+  while (zmq::recv_multipart(sub, std::back_inserter(newer),
+                             zmq::recv_flags::dontwait)
+             .has_value()) {
+    msgs.swap(newer);
+    newer.clear();
+  }
+  return msgs.size() >= 2;
 }
 
 /* The transition graph lives in include/fsm.hpp so that test/fsm_test.cpp can
@@ -760,8 +787,7 @@ public:
 
   auto search_object() -> bool {
     std::vector<zmq::message_t> msgs;
-    auto result = zmq::recv_multipart(color_sub, std::back_inserter(msgs));
-    if (!result.has_value() || msgs.size() < 2)
+    if (!recv_latest(color_sub, msgs))
       return false;
 
     cv::Mat frame(480, 640, CV_8UC3, msgs[1].data());
@@ -785,8 +811,7 @@ public:
 
   auto search_aruco() -> bool {
     std::vector<zmq::message_t> msgs;
-    auto result = zmq::recv_multipart(color_sub, std::back_inserter(msgs));
-    if (!result.has_value() || msgs.size() < 2)
+    if (!recv_latest(color_sub, msgs))
       return false;
 
     cv::Mat frame(480, 640, CV_8UC3, msgs[1].data());
@@ -829,8 +854,7 @@ public:
 
     while (std::chrono::steady_clock::now() < deadline) {
       std::vector<zmq::message_t> msgs;
-      auto result = zmq::recv_multipart(color_sub, std::back_inserter(msgs));
-      if (!result.has_value() || msgs.size() < 2)
+      if (!recv_latest(color_sub, msgs))
         continue;
 
       cv::Mat frame(480, 640, CV_8UC3, msgs[1].data());
@@ -839,6 +863,8 @@ public:
 
       float center_x = -1.0f;
       float bbox_area = 0.0f;
+      float bbox_min_x = 0.0f, bbox_max_x = 0.0f;
+      float bbox_min_y = 0.0f, bbox_max_y = 0.0f;
 
       if (current_waypoint.type == WaypointType::GPS_ARUCO) {
         auto dict = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
@@ -848,16 +874,16 @@ public:
         for (size_t i = 0; i < ids.size(); i++) {
           if (current_waypoint.aruco_id < 0 ||
               ids[i] == current_waypoint.aruco_id) {
-            float min_x = corners[i][0].x, max_x = corners[i][0].x;
-            float min_y = corners[i][0].y, max_y = corners[i][0].y;
+            bbox_min_x = bbox_max_x = corners[i][0].x;
+            bbox_min_y = bbox_max_y = corners[i][0].y;
             for (auto &p : corners[i]) {
-              min_x = std::min(min_x, p.x);
-              max_x = std::max(max_x, p.x);
-              min_y = std::min(min_y, p.y);
-              max_y = std::max(max_y, p.y);
+              bbox_min_x = std::min(bbox_min_x, p.x);
+              bbox_max_x = std::max(bbox_max_x, p.x);
+              bbox_min_y = std::min(bbox_min_y, p.y);
+              bbox_max_y = std::max(bbox_max_y, p.y);
             }
-            center_x = (min_x + max_x) / 2.0f;
-            bbox_area = (max_x - min_x) * (max_y - min_y);
+            center_x = (bbox_min_x + bbox_max_x) / 2.0f;
+            bbox_area = (bbox_max_x - bbox_min_x) * (bbox_max_y - bbox_min_y);
             break;
           }
         }
@@ -865,6 +891,10 @@ public:
         auto detections = detector->detect(frame);
         if (!detections.empty()) {
           auto &b = detections[0].box;
+          bbox_min_x = b.x;
+          bbox_max_x = b.x + b.width;
+          bbox_min_y = b.y;
+          bbox_max_y = b.y + b.height;
           center_x = b.x + b.width / 2.0f;
           bbox_area = b.area();
         }
@@ -877,11 +907,59 @@ public:
       }
       lost_frames = 0;
 
-      /* bbox > 25% of frame ~ within 2m */
-      if (bbox_area > 640.0f * 480.0f * 0.25f)
-        return ApproachResult::ARRIVED;
+      /* When to stop. This used to be "bbox > 25% of frame ~ within 2m",
+         and no approach in any recorded run ever satisfied it: a tag on a
+         post above the camera climbs the image as the rover closes on it,
+         and the sim's left the top of the frame at about 20 %, at which
+         point ArUco -- which needs all four corners -- stopped seeing it and
+         thirty frames later the approach was LOST_TARGET with the rover a
+         metre from the post and the tag out of view for good. On the real
+         rover it is worse: a URC 20 cm tag covers 25 % of a 640x480 frame
+         at 0.45 m, which is the post.
 
-      float error = (center_x - 320.0f) / 320.0f;
+         For a tag the size is known, so the range is known: a marker
+         `marker_size_m` wide that spans `px` pixels is fx * size / px away.
+         The longer side of the box is used so an oblique view, which
+         shrinks the width and not the height, does not read as further.
+         Stop at approach_stop_m, inside the 2 m URC asks for. */
+      bool arrived = false;
+      float range_m = -1.0f;
+      if (current_waypoint.type == WaypointType::GPS_ARUCO) {
+        const float px = std::max(bbox_max_x - bbox_min_x, bbox_max_y - bbox_min_y);
+        range_m = camera_fx * marker_size_m / std::max(px, 1.0f);
+        arrived = range_m <= approach_stop_m;
+      } else {
+        /* An object's size is not known, so the frame fraction stays for
+           it, lowered to something a bottle or a mallet can reach before
+           the rover is on top of it. */
+        arrived = bbox_area > 640.0f * 480.0f * 0.15f;
+      }
+      /* Either way, a target at the *top or bottom* of the frame while
+         already close is the same thing: the rover cannot get nearer
+         without losing sight of it. That covers a post taller than this one
+         or a camera mounted lower, and is what a tag going out of the top
+         of the view looks like the frame before it does. The sides are
+         different -- a tag at the side of the frame is what the search
+         scan hands over, and a turn fixes that -- so they do not count.
+         The margin is the white border the detector needs intact. */
+      constexpr float kEdgePx = 24.0f;
+      const bool at_edge = bbox_min_y <= kEdgePx || bbox_max_y >= 480.0f - kEdgePx;
+      const bool near_enough = range_m >= 0.0f ? range_m <= kUrcStopDistanceM
+                                               : bbox_area > 640.0f * 480.0f * 0.075f;
+      if (at_edge && near_enough)
+        arrived = true;
+      if (arrived) {
+        spdlog::info("approach: arrived, target {} px wide, range {:.2f} m",
+                     bbox_max_x - bbox_min_x, range_m);
+        return ApproachResult::ARRIVED;
+      }
+
+      /* Positive angular_z turns the rover left (it is the yaw rate, the
+         same convention traverse() steers by), so the error has to be
+         positive when the target is left of centre -- image x runs the
+         other way. With the sign the old way round the rover steered away
+         from every marker it found and lost it within 30 frames. */
+      float error = (320.0f - center_x) / 320.0f;
       uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
@@ -987,6 +1065,13 @@ public:
   zmq::socket_t &color_sub;
   const rerun::RecordingStream &rec;
   YOLO8Detector *detector;
+  /* What approach() ranges a tag with: the colour camera's focal length in
+     pixels (from the SLAM config's Camera.fx, the same number stella tracks
+     on), the printed size of the ArUco pattern, and how far from it to
+     stop. URC prints 20 cm tags; the sim's board carries a 0.336 m one. */
+  float camera_fx = 617.0f;
+  float marker_size_m = 0.20f;
+  float approach_stop_m = 1.5f;
 
   /* Retry counts and search deadlines are fsm::run()'s bookkeeping now; this
      only tracks the current state so aborts can name where they happened. */
@@ -1038,7 +1123,12 @@ int main(int argc, char *argv[]) {
       "cloud_source", po::value<std::string>()->default_value("depth"),
       "which cloud the occupancy map is built from: 'depth' (the RGB-D "
       "camera's 55-degree wedge) or 'lidar' (the 360-degree scanner). The "
-      "lidar needs sensor.lidar_offset in the gridmap config.");
+      "lidar needs sensor.lidar_offset in the gridmap config.")(
+      "marker_size", po::value<float>()->default_value(0.20f),
+      "printed width of the ArUco pattern in metres (URC: 0.20; the sim's "
+      "board carries 0.336). approach() ranges the tag from it.")(
+      "approach_stop", po::value<float>()->default_value(1.5f),
+      "how far from an ArUco post to stop, metres. URC scores inside 2.0.");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -1162,6 +1252,18 @@ int main(int argc, char *argv[]) {
                   tarzan::DiffDriveTwist{vm["linear"].as<float>(),
                                          vm["angular"].as<float>()},
                   *backend, color_sub, rec, detector);
+  sm.marker_size_m = vm["marker_size"].as<float>();
+  sm.approach_stop_m = vm["approach_stop"].as<float>();
+  try {
+    sm.camera_fx = YAML::LoadFile(vm["slam_config"].as<std::string>())["Camera"]["fx"]
+                       .as<float>();
+  } catch (const std::exception &e) {
+    spdlog::warn("could not read Camera.fx from slam_config ({}); approach() "
+                 "will range tags with fx = {}",
+                 e.what(), sm.camera_fx);
+  }
+  spdlog::info("approach: fx {:.1f} px, marker {:.3f} m, stop at {:.2f} m",
+               sm.camera_fx, sm.marker_size_m, sm.approach_stop_m);
 
   /* CONFIGURING ZMQ SOCKETS */
   /* Only bind when we are the publisher. In sim the bridge has already bound

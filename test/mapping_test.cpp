@@ -32,6 +32,7 @@
 #include "nav/occupancy_map.hpp"
 #include "nav/params.hpp"
 #include "nav/planner_astar.hpp"
+#include "slam/mount.hpp"
 
 static int failures = 0;
 static void check(bool ok, const char *what) {
@@ -466,6 +467,38 @@ int main(int argc, char **argv) {
           "ground it never looked at costs unknown_cost");
     check(behind < nav::kImpassable, "but is not refused outright");
     check(!map.occupied(-3.0, 0.0), "and occupied() still says it may be entered");
+  }
+
+  std::printf("\n8. the body's pose from the camera's\n");
+  {
+    /* The backend reports the camera, 0.40 m ahead of the body on this
+       rover, in a frame whose origin is where the camera started. Three
+       poses a rover can be in, and where its body must come out:
+       - the first frame: body at the origin, by construction;
+       - a quarter turn on the spot: the camera has swung to (-0.4, 0.4)
+         relative to where it began, and the body has not moved at all;
+       - driven 2 m and turned round: the camera is at world (1.6, 0)
+         looking back, which is (1.2, 0) from its start, and the body is
+         at 2.0. Before this conversion the planner was handed the camera
+         and drew the rover's radius round it. */
+    const double ox = map_params.sensor_offset[0], oy = map_params.sensor_offset[1];
+    auto at = [&](double x, double y, double yaw) {
+      slam::Pose cam; cam.x = x; cam.y = y; cam.z = 0.62; cam.yaw = yaw;
+      return slam::baseFromCamera(cam, ox, oy);
+    };
+    auto near = [](const slam::Pose &p, double x, double y) {
+      return std::hypot(p.x - x, p.y - y) < 1e-6;
+    };
+    check(ox > 0.3, "the sim config mounts the camera ahead of the body");
+    check(near(at(0.0, 0.0, 0.0), 0.0, 0.0), "first frame: body at the origin");
+    check(near(at(-ox, ox, M_PI / 2.0), 0.0, 0.0),
+          "a quarter turn on the spot leaves the body where it was");
+    check(near(at(2.0 - 2.0 * ox, 0.0, M_PI), 2.0, 0.0),
+          "2 m out and turned round: body at 2.0, not the camera's 1.2");
+    check(near(at(5.0, 0.0, 0.0), 5.0, 0.0),
+          "a straight leg is unchanged, which is where the old numbers came from");
+    check(at(1.0, 2.0, 0.7).z == 0.62 && at(1.0, 2.0, 0.7).yaw == 0.7,
+          "z and yaw pass through untouched");
   }
 
   std::printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",

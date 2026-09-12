@@ -30,11 +30,11 @@ struct rs_handler *setupRealsense(struct rs_config &config) {
   if (devices.size() == 0)
     return nullptr;
 
-  stream_config.enable_stream(rs2_stream::RS2_STREAM_COLOR, 0, config.height,
-                              config.width, rs2_format::RS2_FORMAT_BGR8,
+  stream_config.enable_stream(rs2_stream::RS2_STREAM_COLOR, 0, config.width,
+                              config.height, rs2_format::RS2_FORMAT_BGR8,
                               config.fps);
-  stream_config.enable_stream(rs2_stream::RS2_STREAM_DEPTH, 0, config.height,
-                              config.width, rs2_format::RS2_FORMAT_Z16,
+  stream_config.enable_stream(rs2_stream::RS2_STREAM_DEPTH, 0, config.width,
+                              config.height, rs2_format::RS2_FORMAT_Z16,
                               config.fps);
   if (config.enable_imu) {
     stream_config.enable_stream(rs2_stream::RS2_STREAM_ACCEL,

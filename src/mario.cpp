@@ -1,3 +1,4 @@
+#include <array>
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
 #include <chrono>
@@ -42,6 +43,7 @@
 #include "pid.hpp"
 #include "serial.hpp"
 #include "slam/backend.hpp"
+#include "slam/mount.hpp"
 #include "slam/stella_backend.hpp"
 #include "utils.hpp"
 #include "yolo.hpp"
@@ -86,7 +88,9 @@ auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
       size_t colorFrame_len = colorFrame.get_data_size();
       size_t depthFrame_len = depthFrame.get_data_size();
 
-      double timestamp = fs.get_timestamp();
+      /* librealsense stamps in milliseconds; stella_vslam and the sim bridge
+         both speak seconds. */
+      double timestamp = fs.get_timestamp() / 1000.0;
 
       rs2::points points = rs_ptr->pc.calculate(depthFrame);
       const rs2::vertex *vertices = points.get_vertices();
@@ -141,11 +145,14 @@ auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
   }
 }
 
-/* function to get slam pose */
+/* function to get slam pose. `camera_mount` is where the camera sits in the
+   base frame (MapParams::sensor_offset): the backend reports the camera's
+   pose, and everything downstream wants the body's -- see slam/mount.hpp. */
 auto localize(slam::Backend &backend,
               utils::SharedLatest<struct slam::Pose> &poseState,
               zmq::socket_t &sub, const rerun::RecordingStream &rec,
-              utils::rs_config realsense_config) -> void {
+              utils::rs_config realsense_config,
+              std::array<float, 3> camera_mount) -> void {
 
   std::vector<zmq::message_t> colorFrameMsg;
   std::vector<zmq::message_t> depthFrameMsg;
@@ -155,24 +162,57 @@ auto localize(slam::Backend &backend,
   zmq::recv_result_t result_timestamp;
 
   slam::Frame frame;
-  /* rs_config's `height` and `width` are swapped relative to how they are
-     handed to enable_stream -- a known bug, on the out-of-scope list in
-     tweaks/REFACTOR_NAV.md. `height` is the field holding 640, so it is the
-     image width. This reproduces the size slam.cpp used to hardcode. */
-  frame.width = realsense_config.height;
-  frame.height = realsense_config.width;
+  /* rs_config's `height` and `width` used to be swapped relative to how they
+     were handed to enable_stream -- a known bug, once on the out-of-scope
+     list in tweaks/REFACTOR_NAV.md, when `height` was the field holding 640
+     and so the image width, and this reproduced the size slam.cpp used to
+     hardcode. utils.cpp hands them over the right way round now, so these
+     read straight. */
+  frame.width = realsense_config.width;
+  frame.height = realsense_config.height;
+
+  /* The publisher sends colour, depth, timestamp in that order, and this
+     loop reads them positionally -- so it has to know when it is out of
+     step. It used to trust the order blindly, which held only as long as
+     nothing was ever dropped; now a recv can time out (rcvtimeo, so the
+     thread can exit) with the triplet half read, and the next iteration
+     would begin on the previous timestamp and hand SLAM a 17-byte string as
+     a colour image from then on. Every part is checked against its topic.
+     A part that is not the one expected is dropped *on its own* and the
+     search for a colour frame starts over -- dropping the whole triplet
+     would keep the same phase error forever. */
+  auto topic_is = [](const std::vector<zmq::message_t> &msg,
+                     const std::string &topic) {
+    return msg.size() >= 2 && msg[0].to_string_view() == topic;
+  };
+  auto topic_of = [](const std::vector<zmq::message_t> &msg) {
+    return msg.empty() ? std::string("<timeout>") : msg[0].to_string();
+  };
 
   while (true) {
+    colorFrameMsg.clear();
+    depthFrameMsg.clear();
+    timestampMsg.clear();
+
     result_color = zmq::recv_multipart(sub, std::back_inserter(colorFrameMsg));
+    if (!result_color.has_value())
+      continue;
+    if (!topic_is(colorFrameMsg, topic_color)) {
+      spdlog::warn("localize: expected {} but got {} -- resyncing",
+                   topic_color, topic_of(colorFrameMsg));
+      continue;
+    }
+
     result_depth = zmq::recv_multipart(sub, std::back_inserter(depthFrameMsg));
     result_timestamp =
         zmq::recv_multipart(sub, std::back_inserter(timestampMsg));
-
-    if (!result_color.has_value() || !result_depth.has_value() ||
-        !result_timestamp.has_value()) {
-      colorFrameMsg.clear();
-      depthFrameMsg.clear();
-      timestampMsg.clear();
+    if (!result_depth.has_value() || !result_timestamp.has_value() ||
+        !topic_is(depthFrameMsg, topic_depth) ||
+        !topic_is(timestampMsg, topic_timestamp)) {
+      spdlog::warn("localize: frame parts out of order ({}, {}, {}) -- "
+                   "resyncing",
+                   topic_of(colorFrameMsg), topic_of(depthFrameMsg),
+                   topic_of(timestampMsg));
       continue;
     }
 
@@ -185,16 +225,13 @@ auto localize(slam::Backend &backend,
 
     struct slam::Pose pose;
     if (backend.track(frame, pose)) {
+      pose = slam::baseFromCamera(pose, camera_mount[0], camera_mount[1]);
       poseState.set(pose);
 
       std::string coordinates =
           std::format("x: {} y: {} yaw: {}", pose.x, pose.y, pose.yaw);
       rec.log("SlamPose", rerun::TextLog(coordinates));
     }
-
-    colorFrameMsg.clear();
-    depthFrameMsg.clear();
-    timestampMsg.clear();
   }
 }
 
@@ -1051,7 +1088,7 @@ int main(int argc, char *argv[]) {
 
   /* realsense vars */
   struct utils::rs_config realsense_config{
-      .height = 640, .width = 480, .fps = 30, .enable_imu = false};
+      .height = 480, .width = 640, .fps = 30, .enable_imu = false};
   struct utils::rs_handler *rs_ptr = nullptr;
 
   /* slam vars.
@@ -1170,9 +1207,12 @@ int main(int argc, char *argv[]) {
   std::thread capture_thread;
   if (!sim_mode)
     capture_thread = std::thread(capture_frame, rs_ptr, std::ref(pub));
-  std::thread localize_thread(localize, std::ref(*backend), std::ref(poseState),
-                              std::ref(slam_sub), std::ref(rec),
-                              realsense_config);
+  std::thread localize_thread(
+      localize, std::ref(*backend), std::ref(poseState), std::ref(slam_sub),
+      std::ref(rec), realsense_config,
+      std::array<float, 3>{map_params.sensor_offset[0],
+                           map_params.sensor_offset[1],
+                           map_params.sensor_offset[2]});
   std::thread mapping_thread(mapping, std::ref(occupancy_map),
                              std::ref(poseState), std::ref(mapping_sub),
                              std::ref(rec), realsense_config, use_lidar);

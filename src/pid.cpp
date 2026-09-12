@@ -101,7 +101,7 @@ int main(int argc, char *argv[]) {
 
   // rs vars
   struct utils::rs_config realsense_config{
-      .height = 640, .width = 480, .fps = 30, .enable_imu = false};
+      .height = 480, .width = 640, .fps = 30, .enable_imu = false};
   struct utils::rs_handler *rs_ptr;
   rs2::frame frame;
   rs_ptr = utils::setupRealsense(realsense_config);

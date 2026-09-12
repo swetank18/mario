@@ -53,6 +53,7 @@
 #include "nav/params.hpp"
 #include "nav/planner_astar.hpp"
 #include "slam/backend.hpp"
+#include "slam/mount.hpp"
 #include "slam/stella_backend.hpp"
 #include "utils.hpp"
 
@@ -577,6 +578,7 @@ int main(int argc, char **argv) {
   long timestamp_regressions = 0;
 
   double pos_err_sum = 0.0, pos_err_max = 0.0;
+  double cam_err_sum = 0.0, cam_err_max = 0.0; // the raw camera pose, for comparison
   double yaw_err_sum = 0.0, yaw_err_max = 0.0;
   long scored = 0;
   double min_clearance_at_rover = 1e9;
@@ -641,6 +643,12 @@ int main(int argc, char **argv) {
       lost_frames++;
     if (!got_pose)
       continue;
+    /* The backend's pose is the camera's; the GPS this is scored against sits
+       on the body, and so does everything mapping() places relative to the
+       pose. Same conversion localize() applies (slam/mount.hpp). */
+    const slam::Pose camera = pose;
+    pose = slam::baseFromCamera(pose, map_params.sensor_offset[0],
+                                map_params.sensor_offset[1]);
 
     tracked++;
     if (first_track_frame < 0)
@@ -654,6 +662,9 @@ int main(int argc, char **argv) {
       const double yaw_err = std::abs(normalizeAngle(pose.yaw - truth_yaw));
       pos_err_sum += pos_err;
       pos_err_max = std::max(pos_err_max, pos_err);
+      const double cam_err = std::hypot(camera.x - truth_x, camera.y - truth_y);
+      cam_err_sum += cam_err;
+      cam_err_max = std::max(cam_err_max, cam_err);
       yaw_err_sum += yaw_err;
       yaw_err_max = std::max(yaw_err_max, yaw_err);
       scored++;
@@ -785,6 +796,9 @@ int main(int argc, char **argv) {
   if (scored) {
     std::printf("       position error  mean %.3f m   max %.3f m\n",
                 pos_err_sum / scored, pos_err_max);
+    std::printf("       (raw camera pose, before slam/mount.hpp: mean %.3f m   "
+                "max %.3f m)\n",
+                cam_err_sum / scored, cam_err_max);
     std::printf("       yaw error       mean %.1f deg  max %.1f deg\n",
                 yaw_err_sum / scored * 180.0 / M_PI,
                 yaw_err_max * 180.0 / M_PI);

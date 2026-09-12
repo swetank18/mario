@@ -92,7 +92,7 @@ auto runLocalization(RGBDFrame *frame_cv, slamHandle *handle)
 int main() {
   spdlog::set_level(spdlog::level::debug);
   struct utils::rs_config realsense_config{
-      .height = 640, .width = 480, .fps = 30, .enable_imu = false};
+      .height = 480, .width = 640, .fps = 30, .enable_imu = false};
 
   const auto rec = rerun::RecordingStream("TEAM RUDRA AUTONOMOUS - mario");
 

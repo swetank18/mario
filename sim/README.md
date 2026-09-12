@@ -43,7 +43,7 @@ boundary.
 | `tools/bridge_check.cpp` | Standalone bridge validator (libzmq + OpenCV only) |
 | `tools/slam_map_check.cpp` | stella_vslam -> occupancy map -> A*, scored against the sim's GPS |
 | `tools/record_stream.py` | Records the rover's camera + depth + lidar to an mp4 |
-| `record_mission.sh` | Runs and records the full mario mission |
+| `record_mission.sh` | Runs and records the full mario mission (depth map by default, `CLOUD_SOURCE=lidar` for the scanner) |
 | `worlds/test_marker.wbt` | Rover parked 3 m in front of the marker |
 | `run_sim.sh` | Launches Webots, waits for the pty, starts mario |
 
@@ -135,14 +135,18 @@ Rover starts at the origin facing East (+X). Waypoints, in local ENU metres:
 | 2 | (24, 8) | `GPS_ARUCO` id 1 | `SEARCH_TARGET` -> `APPROACH_TARGET`; board sits 2 m beyond at (26, 8) |
 | 3 | (24, -8) | `GPS_OBJECT` | YOLO search; cone 2 m beyond at (26, -8) |
 
-`approach()` exits when the bounding box exceeds 25 % of the frame
-(`640*480*0.25` = 76800 px²). Measured from the sim: the marker covers
-6162 px² at 3 m, and area scales as 1/d², so the threshold is reached at about
-**0.85 m**. That is inside the URC 2 m requirement but closer than it looks —
-`detectMarkers` returns the inner 0.336 m pattern, not the full 0.6 m board,
-because `gen_textures.py` leaves a 22 % white border on each side. Widen the
-board or lower the 0.25 factor in `approach()` if you want it to stop further
-out.
+`approach()` ranges the tag from its width in the image -- `fx * marker_size
+/ px`, with `fx` from the SLAM config's `Camera.fx` -- and stops at
+`--approach_stop` (default 1.5 m; URC scores inside 2 m). The sim's board
+carries a **0.336 m** pattern, not the 20 cm URC prints, because
+`gen_textures.py` leaves a 22 % white border on each side of the 0.6 m board
+and `detectMarkers` returns the inner pattern; the launchers pass
+`--marker_size 0.336` for that reason, and the real rover gets the default
+0.20. The old criterion was "the box covers 25 % of the frame", which the
+sim's tag could not satisfy: mounted 1.05 m up against a camera at 0.62 m, it
+left the top of the frame at about 20 %, so every recorded approach ended in
+`LOST_TARGET` with the rover a metre from the post. A tag touching the top or
+bottom of the frame inside 2 m is taken as arrived for the same reason.
 
 `worlds/test_marker.wbt` is the same course with the rover parked 3 m in front
 of the marker, for checking detection without driving the whole mission.
@@ -153,19 +157,17 @@ Kept in `KNOWN_ISSUES.md` at the repo root rather than duplicated here -- the
 list in this file went stale once the map started recentring on the rover and
 the control-loop defects were fixed. The two that most affect running the sim:
 
-- **No YOLO model in the tree.** `--yolo_model` has no default and `model/`
-  holds only `labels.names` (`right`, `left`, `cone`). mario constructs the
-  detector unconditionally at startup, so it needs *some* loadable ONNX file.
-  Without a trained one the `GPS_OBJECT` waypoint runs out its 60 s search and
-  takes the partial-credit path to `WAYPOINT_REACHED` -- still a valid FSM
-  path, just not a detection test.
+- **No YOLO model in the tree.** `model/` holds only `labels.names`
+  (`right`, `left`, `cone`). `--yolo_model` is optional, so mario runs without
+  one; the `GPS_OBJECT` waypoint then runs out its 60 s search and takes the
+  partial-credit path to `WAYPOINT_REACHED` -- still a valid FSM path, just
+  not a detection test.
 
-- **`localize()` assumes strict message ordering** (`src/mario.cpp`). Three
-  positional `recv_multipart` calls treated as colour, depth, timestamp. The
-  bridge publishes in that order, and its high-water mark is now large enough
-  to hold whole steps rather than dropping messages from the middle of one,
-  but the assumption is still fragile. `sim/tools/slam_map_check.cpp`
-  dispatches on the topic name instead and will not desync.
+- **`localize()` reads colour, depth, timestamp positionally**
+  (`src/mario.cpp`), but checks each part's topic now and resyncs one
+  message at a time on a mismatch, so a dropped or late message costs a
+  frame rather than the rest of the run. The bridge's high-water mark is
+  large enough to hold whole steps, so it should not come up in practice.
 
 ## The lidar
 

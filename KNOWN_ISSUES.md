@@ -8,76 +8,204 @@ tracked in the out-of-scope list in `tweaks/REFACTOR_NAV.md`.
 
 ### 1. The lidar is blind within 3.4 m of the rover
 
-The scanner sits 0.90 m up with a 30-degree vertical spread, so its lowest
-beam does not reach the ground until 0.90 / tan(15 deg) = 3.4 m out. Inside
-that radius there is nothing but the few returns off anything tall enough to
-rise into the beam. It shows up as a black ellipse around the rover in
-`artifacts/lidar_map.png`.
+Only matters when building from the lidar (`--cloud_source lidar`), which
+exists in the sim and nowhere else -- the real rover carries a D435i and
+builds from `depth`. The scanner sits 0.90 m up with a 30-degree vertical
+spread, so its lowest beam does not reach the ground until
+0.90 / tan(15 deg) = 3.4 m out, exactly the range `traverse()`'s trip wire
+cares about. The map now knows this (`sensor.lidar_fov`) and does not forget
+what it cannot see there, but it cannot map what it never saw either. If a
+lidar is ever fitted, the two want fusing: lidar beyond 3.5 m, depth camera
+inside it.
 
-That is normal for a VLP-16-class scanner and it is exactly the range at which
-`traverse()`'s obstacle trip wire operates -- the wire asks about clearance
-within 0.53 m of the rover, which the lidar physically cannot measure. Today
-the map is built from one source or the other (`--cloud_source`), so choosing
-the lidar buys 360-degree coverage at the cost of the near field, and choosing
-the depth camera buys the near field at the cost of everything behind. The two
-want fusing rather than choosing: lidar beyond 3.5 m, depth camera inside it.
+### 2. Three numbers in `config/gridmap_rover.yaml` are guesses
 
-### 2. `RECOVER_SLAM` stops the rover, which is the one thing that cannot help
+`sensor.offset`, `planner.rover_radius` and `planner.safety_margin` are
+marked MEASURE. The values are the sim rover's, and the real mast and chassis
+are not the sim's. A wrong `sensor.offset.z` maps every metre of ground as
+a ditch; the ground-plane estimate rescues it but the log will say
+"ground plane measured at N m", and that is the signal. Nothing here has run
+on hardware.
 
-Unchanged from the last pass, and still the reason a duplicate-frame stall is
-fatal. stella_vslam needs parallax to re-initialise, and the recovery
-strategy's first act is to remove all of it. A recovery that rotates slowly on
-the spot would fix both this and the ordinary loss-of-tracking case.
+### 3. No trained object detector exists
 
-### 3. The map forgets an obstacle a few seconds after it leaves the sensor
+`--yolo_model` is optional now and mario runs without one, but `model/`
+still holds only `labels.names` (right, left, cone). Without a model the
+`GPS_OBJECT` waypoint searches for its full 60 s and takes partial credit.
+A stock COCO yolov8n has the wrong output shape for those labels.
 
-`forget_after: 40` is 2.7 s at the depth camera's 15 Hz and 5.3 s at the
-lidar's 7.5 Hz. With 360-degree coverage this matters far less than it did --
-the lidar keeps seeing what the camera lost -- but the underlying behaviour is
-the same, and the measured effect on mapped rock faces is in the last pass's
-notes. A decay on the elevation blend would handle a person walking the course
-without discarding static geometry.
+### 4. Localisation has no fallback but a reset
 
-### 4. A planner cannot tell unexplored ground from ground observed to be flat
+The pose is stella_vslam or nothing: no IMU (`enable_imu = false`), no wheel
+odometry, and the GPS only ever steers the goal. RECOVER_SLAM now sweeps the
+camera to relocalise and, failing that, resets the backend and the map --
+which the mission survives because every leg re-projects its goal from the
+GPS fix and compass heading of the moment. But the ~10 s a reset costs and
+the map it throws away are both avoidable with an odometry bridge across the
+gap. Outdoors in daylight, on low-texture ground, expect to need it.
 
-Unchanged. With `unknown_is_occupied: false` a never-observed cell answers
-`occupied()`, `clearance()` and `traversal_cost()` exactly as a cell measured
-to be flat does, so A* cannot prefer explored ground even when it has the
-choice.
+### 5. LED signalling is log-only
 
-### 5. `PlanResult::FAULT` is routed to `FAULT_SERIAL`
-
-`plan()` returns `FAULT` both when the serial link fails and when A* finds no
-path, and `fsm.hpp` maps that to `FAULT_SERIAL`, which retries five times and
-then aborts the mission. Those are different failures wanting different
-answers -- a planning failure should back off, widen the goal, or wait for the
-map to fill in, none of which involve the serial port. Observed aborting a
-mission over a planning failure with the link perfectly healthy.
-
-### 6. The background threads never exit, so `main` never returns
-
-`capture_frame`, `localize` and `mapping` all loop on `while (true)`. Once
-`sm.run()` finishes the joins at the bottom of `main` block forever. The
-mission completes correctly and logs "mission complete"; the process then has
-to be killed. `sim/record_mission.sh` watches the log rather than the process
-for exactly this reason.
-
-### 7. There is no committed gridmap config for the real rover
-
-`sim/config/gridmap_sim.yaml` is still the only one in the tree, and its
-`sensor.offset`, `sensor.lidar_offset` and `planner.rover_radius` all describe
-the *sim* rover. Measure all three against the real chassis.
-
-### 8. `include/yolo.hpp` is vendored, wired in, and has no model to run
-
-`main()` constructs a `YOLO8Detector` unconditionally, so mario will not start
-without a loadable ONNX file, and nothing in the tree provides one -- `model/`
-holds only `labels.names` with three classes (right, left, cone). A stock COCO
-yolov8n is the wrong shape for those labels. The runs in these passes used a
-generated stub with the right tensor shapes that detects nothing, kept
-deliberately outside the tree.
+`signal_led()` prints. The Nucleo protocol for the light has not been
+defined, and URC scores the light.
 
 ## Fixed
+
+### The SLAM pose was the camera's, and everything downstream treated it as the body's
+
+`StellaBackend::track()` applies `kCameraToBase`, the optical-to-FLU
+*rotation*, so `Pose` was the camera's position in the frame of the camera's
+first view. The GPS is on the body, `get_local_goal()` projected the next
+goal from the GPS fix relative to that pose, the planner drew `rover_radius`
+about it, and `mapping()` placed the sensor `sensor.offset` (0.40 m
+forward) ahead of it *again*. The map frame therefore slid by
+`R(yaw) * offset` as the rover turned: an obstacle seen heading east and
+the same one seen heading west landed up to 0.8 m apart. It cancelled on a
+straight leg, which is where every previous check had measured it.
+
+`slam/mount.hpp` turns the camera's pose into the body's -- `base = camera
++ o - R(yaw) * o`, which also moves the world origin from where the camera
+started to where the body started, so z and the ground plane stay exactly
+where every consumer expects them -- and `localize()` applies it with
+`sensor.offset` before the pose reaches the map, the planner or the FSM.
+`slam_map_check` scores the same pose against the sim's body-mounted GPS
+over a course with a rotation on the spot, and now reports both:
+
+| | mean | max |
+|---|---|---|
+| raw camera pose (before) | 0.064 m | 0.303 m |
+| body pose (after) | 0.016 m | 0.043 m |
+
+Ground plane still at 0.02 m, rock faces still within one cell.
+`test/mapping_test.cpp` 8 covers the conversion.
+
+### `slam_test` and `pid_test` waited forever for a RealSense
+
+`slam_test` dereferenced the null handle `setupRealsense()` returns without
+a device; both then sat in an unbounded `wait_for_frame()` on a camera that
+enumerated but never delivered. Both exit with a message now: no device, or
+no frame in 5 s.
+
+### `approach()` could never arrive, so every ArUco waypoint took partial credit
+
+It stopped when the target's box covered 25 % of the frame. A tag mounted
+above the camera climbs the image as the rover closes on it, and the sim's
+left the top of the frame at about 20 % -- at which point ArUco, which needs
+all four corners, stopped seeing it, thirty frames later the approach was
+`LOST_TARGET`, and the search that followed span on the spot a metre from a
+post whose tag was above its field of view. Every approach in every recorded
+run (the 2026-08-26 lidar mission, the 2026-08-31 rerun, both depth runs
+today) ended that way; the waypoint was only ever reached on the 60 s search
+timeout. On the real rover it is worse: a 20 cm URC tag covers 25 % of a
+640x480 frame at 0.45 m, which is the post.
+
+A tag's size is known, so its range is: `fx * marker_size / px`, with `fx`
+from the SLAM config, `--marker_size` (default 0.20 m, the sim's launchers
+pass 0.336) and `--approach_stop` (1.5 m, inside the 2 m URC scores). A tag
+touching the top or bottom of the frame inside 2 m counts too, since the
+rover cannot get closer without losing it. Objects keep the frame-fraction
+rule, lowered to 15 %. Depth run 4: found, approached, **arrived at 1.5 m**,
+`APPROACH_TARGET -> WAYPOINT_REACHED`.
+
+### `localize()` could desync for good on one dropped message
+
+Colour, depth and timestamp were three positional `recv_multipart` calls
+trusted blindly. With the 500 ms `rcvtimeo` the clean-exit work added, a
+timeout mid-triplet meant the next iteration began on the previous
+timestamp, and stella_vslam was handed a 17-byte string as a colour image
+from then on. Each part is checked against its topic now and a mismatch
+drops one message, not three -- dropping the whole triplet keeps the phase
+error forever -- so the cost is one frame.
+
+### A stalled telemetry sink held the process open after `mission complete`
+
+With the threads joined and the result logged, the Rerun stream's
+destructor tries to shut its gRPC client down gracefully, and against a peer
+that accepts the connection but never answers it waits forever, with
+stella_vslam's shutdown queued behind it. Seen on the first depth run:
+"mission complete", "exiting (mission done)", process alive four minutes
+later until the peer was killed. A real viewer acks and a dead one errors
+through; only a frozen one hangs. `main` now starts a ten-second watchdog
+after the orderly cleanup that `_Exit`s with the same code, so the launch
+scripts can rely on the process ending. For the sim, `rerun --serve-grpc
+--port 9876` (the `rerun-sdk` wheel ships the binary) is the peer to use.
+
+### `RECOVER_SLAM` stopped the rover, which is the one thing that cannot help
+
+A lost backend needs a view it recognises, and a rover frozen facing whatever
+it lost tracking on will never get one. The state now sweeps the camera round
+slowly (`slam_recover_step()`, a quarter of the angular limit) while polling
+for tracking, and when the old map never comes back it throws it away:
+`reset_slam()` invalidates the pose, resets the backend, clears the
+occupancy map and drops the path, and the FSM waits for the fresh map to
+initialise before replanning. Only if that also fails does it abort. The
+mission survives a new SLAM origin because `plan()` re-projects its goal
+from GPS and compass every time; nothing upstream remembers the old frame.
+`test/fsm_test.cpp` 9, 9b, 9c and 10 cover the four outcomes.
+
+### The map forgot an obstacle a few seconds after the camera turned away
+
+`forget_after` aged every cell on every integration whether or not the
+sensor was pointed at it, so with a 55-degree camera a boulder beside the
+rover was gone from the map 2.7 s after the rover turned, and A* planned
+through where it had just been. A miss now only counts when the sensor could
+have seen what the cell holds: inside the horizontal field of view, within
+range, and -- the part that matters for a camera 0.62 m up -- with the ray to
+the cell's stored elevation inside the vertical spread, so flat ground under
+the lowest ray is not aged out either. `sensor.fov` / `sensor.lidar_fov` in
+the config; the defaults see everything in range, which reproduces the old
+rule. `test/mapping_test.cpp` 5 and 6, with the old rule as the control.
+
+### A planner could not tell unexplored ground from ground observed to be flat
+
+`traversal_cost()` on a never-observed cell now returns
+`grid_map.unknown_cost` (2.0, i.e. 1.4x the distance at the default terrain
+weight) instead of 0, so A* prefers ground it has looked at where it has the
+choice and still crosses unknown ground where it has not. `occupied()` is
+unchanged. `test/mapping_test.cpp` 7.
+
+### `PlanResult::FAULT` was routed to `FAULT_SERIAL`
+
+`plan()` returns `NO_PATH` for a planning failure and `FAULT` only for the
+link. `NO_PATH` goes to a new `RECOVER_PLAN` state, which changes something
+before asking again -- attempt 1 waits for the map, later attempts back out
+if the rover is boxed in and otherwise turn to put new ground on the map --
+while `plan()` halves the local goal for every failure in a row. After
+`max_plan_retries` (8) the waypoint is skipped and the next one loaded,
+rather than the mission aborted. `test/fsm_test.cpp` 10b, 10c, 10d.
+
+### The background threads never exited, so `main` never returned
+
+`g_running` is cleared when `fsm::run()` returns; every blocking call in the
+workers has a 500 ms timeout (`rcvtimeo` on the subscribers,
+`wait_for_frame(ms)` on the RealSense queue); `main` joins them and returns
+0 for MISSION_DONE, 2 for an abort. `sim/record_mission.sh` waits on the
+process now.
+
+### `mario` would not start without a YOLO ONNX file
+
+`--yolo_model` is optional. Missing, nonexistent or unloadable, the
+detector is null: `search_object()` returns false (with one warning),
+`approach()` on an object waypoint returns `LOST_TARGET`, and the ArUco path
+is unaffected.
+
+### RealSense timestamps were in milliseconds, the sim's in seconds
+
+`capture_frame()` divides `fs.get_timestamp()` by 1000 before publishing, so
+stella_vslam sees the same units from either source.
+
+### `rs_config`'s `height` and `width` were swapped
+
+`.height = 640, .width = 480` was handed to `enable_stream(width, height)`
+and every reader had to know. Now 640 is `width`.
+
+### The serial wire layout was unpinned
+
+`static_assert`s pin `tarzan_msg` at 12 bytes and `geodetic_msg` at 40 --
+the padded size every ABI in use produces, and what the sim bridge sends --
+so a change to either struct fails at compile time rather than as CRC errors
+on the rover.
+
 
 ### Every clearance threshold was smaller than the rover
 

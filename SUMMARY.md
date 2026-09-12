@@ -1,3 +1,104 @@
+# The D435i mission: recovery states, a real approach, a clean exit — 2026-09-12
+
+Same branch, nothing pushed. Two passes' worth: the 2026-09-11 changes had
+been written but never compiled (the build directories predated them), and
+this pass built them, tested them, ran the mission on the depth camera --
+the sensor the real rover has -- and fixed what that run turned up.
+
+## The rover finishes the course on the depth camera
+
+`mario --sim --cloud_source depth`, no lidar, no YOLO model, real
+stella_vslam, real A*, real FSM, five runs today. The last three:
+
+```
+BOOT -> WAIT_MAP_READY -> LOAD_WAYPOINT -> PLAN_PATH -> TRAVERSE_PATH
+     -> WAYPOINT_REACHED                     waypoint 1, GPS_ONLY
+     -> SEARCH_TARGET -> APPROACH_TARGET
+     -> WAYPOINT_REACHED                     waypoint 2, ArUco id 1, ARRIVED at 1.49 m
+     -> SEARCH_TARGET (60 s, no detector)
+     -> WAYPOINT_REACHED                     waypoint 3, GPS_OBJECT, partial credit
+     -> MISSION_DONE, process exits 0
+```
+
+| run | map | ArUco waypoint ended by | time | obstacle recoveries | exit |
+|---|---|---|---|---|---|
+| 1 | depth | search timeout (approach lost the tag) | 5 min 19 s | 8 | hung in a destructor, see below |
+| 2 | depth | search timeout (approach lost the tag) | 6 min 26 s | 12 | clean, rc 0 |
+| 3 | depth | **ARRIVED**, 1.90 m, edge rule | 4 min 00 s | 11 | clean, rc 0 |
+| 4 | depth | **ARRIVED**, 1.49 m, ranged | 5 min 11 s | 6 | clean, rc 0 |
+| 5 | depth, body pose | **ARRIVED**, 1.48 m, ranged | 3 min 15 s | 2 | clean, rc 0 |
+
+Run 5 is the one with the camera-to-body pose fix below, and the first to
+exercise `RECOVER_SLAM` live: stella_vslam lost tracking on the third leg
+straight after a loop-closure bundle adjustment, the ten-second sweep did
+not relocalise, the backend was reset, a new map was up within 0.15 s, and
+the rover replanned and finished. `RECOVER_PLAN` was never needed; it is
+covered by `fsm_test`.
+
+## What the 2026-09-11 pass changed, now verified
+
+Built and passing in both configurations. `RECOVER_SLAM` sweeps the camera
+and then resets the backend and the map instead of freezing; the map only
+forgets a cell the sensor could actually see (`sensor.fov`); unexplored
+ground costs `unknown_cost`; `plan()` says `NO_PATH` and a new
+`RECOVER_PLAN` state changes something before asking again, skipping the
+waypoint after eight tries rather than aborting the mission; the worker
+threads exit and `main` returns 0 or 2; `--yolo_model` is optional; RealSense
+timestamps are seconds; `rs_config` has its width and height the right way
+round; the serial structs are pinned. All in `KNOWN_ISSUES.md` under Fixed,
+with the tests that cover each.
+
+## What the depth runs turned up — four defects
+
+1. **`approach()` could never arrive.** It stopped at "the box covers 25 %
+   of the frame", and a tag mounted above the camera leaves the top of the
+   frame at about 20 %. Every approach in every recorded run, back to the
+   first complete mission on 2026-08-26, ended in `LOST_TARGET` with the
+   rover a metre from the post, and the waypoint was only ever reached on
+   the search timeout. On the real rover a 20 cm URC tag would need 0.45 m.
+   The tag is ranged from its size now (`fx * marker_size / px`) and the
+   approach stops at 1.5 m; runs 3 and 4 above.
+
+2. **`localize()` could desync for good on one dropped message.** Three
+   positional receives, and with the new 500 ms timeout a half-read triplet
+   put SLAM one message out of step from then on. Topic-checked, resyncing
+   one message at a time.
+
+3. **A telemetry peer that accepts but never answers hangs the exit.** Run 1
+   logged "mission complete" and "exiting" and was still alive four minutes
+   later, in the Rerun stream's destructor, with stella_vslam's shutdown
+   behind it. A ten-second watchdog `_Exit`s with the same code. The peer
+   in that run was a stand-in socket; `rerun --serve-grpc` (the `rerun-sdk`
+   wheel in `~/venv` ships the binary) is the right one and runs 2-4 used it.
+
+4. **The SLAM pose was the camera's, not the body's.** `kCameraToBase` is
+   a rotation only, so the planner drew the rover's radius round the
+   camera, the goal was projected from a GPS 0.40 m behind it, and the map
+   put the sensor 0.40 m ahead of itself -- a frame that slid by
+   `R(yaw) * offset` on every turn, and cancelled on the straight legs where
+   it had always been measured. `slam/mount.hpp` converts to the body pose
+   in `localize()`; `slam_map_check` over its rotate-on-the-spot course:
+   raw camera **0.064 / 0.303 m** (mean / max) against the body-mounted GPS,
+   body pose **0.016 / 0.043 m**. Ground plane and rock faces unchanged.
+
+And `slam_test` / `pid_test` exit with a message instead of waiting forever
+for a RealSense that is absent or silent.
+
+## Verified
+
+| | |
+|---|---|
+| `ctest` (fsm, nav, mapping, planner) | 4/4, both Debug and optimised |
+| `fsm_test` 9b, 9c, 10, 10b, 10c, 10d | the new recovery paths, scripted |
+| `mapping_test` 5, 6, 7, 8 | FOV-aware forgetting, unknown cost, camera-to-body pose |
+| `slam_map_check` | all pass; body pose 0.016 m mean against GPS through a rotation |
+| `mario --sim --cloud_source depth` | MISSION_DONE 5/5 runs, rc 0 on the last four |
+
+Artefacts (untracked): `artifacts/mission_depth{,2,3,4,5}.mp4`, the rover's
+camera, depth and lidar panels off the ZMQ bus for each run.
+
+---
+
 # LiDAR, a finished mission, and a video — 2026-08-26
 
 Same branch, nothing pushed. The previous pass got stella_vslam running and

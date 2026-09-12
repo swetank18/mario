@@ -163,6 +163,14 @@ public:
     item = value;
     return true;
   }
+
+  /* Back to "nothing yet". For a SLAM reset: the last pose set is in a frame
+     that no longer exists, and a consumer that reads it would fold the next
+     cloud into the new map at the old origin. */
+  void invalidate() {
+    std::lock_guard<std::mutex> lock(mtx);
+    valid = false;
+  }
 };
 
 void yasmin_to_spdlog(yasmin::LogLevel level, const char *file,

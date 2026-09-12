@@ -24,6 +24,10 @@
  *   bool          search_scan_step()       // false on serial write failure
  *   ApproachResult approach()
  *   bool          slam_tracking()
+ *   bool          slam_recover_step()      // nudge the camera; false on serial failure
+ *   void          reset_slam()             // throw the map away and start again
+ *   bool          recover_plan(int attempt) // change something before replanning
+ *   void          on_waypoint_skipped()
  */
 
 #include <chrono>
@@ -43,6 +47,7 @@ enum class State {
   WAYPOINT_REACHED,
   RECOVER_SLAM,
   RECOVER_OBSTACLE,
+  RECOVER_PLAN,
   FAULT_SERIAL,
   MISSION_DONE,
   MISSION_ABORT
@@ -56,7 +61,11 @@ enum class TraverseResult {
   FAULT_SERIAL
 };
 
-enum class PlanResult { PATH_FOUND, AT_GOAL, FAULT };
+/* NO_PATH and FAULT used to be one value, and the graph sent both to
+   FAULT_SERIAL: five retries against a perfectly healthy link and then a
+   mission abort, over a planner that just needed the rover to back up or the
+   map to fill in. FAULT is now strictly the serial link. */
+enum class PlanResult { PATH_FOUND, AT_GOAL, NO_PATH, FAULT };
 
 enum class ApproachResult { ARRIVED, LOST_TARGET, FAULT_SERIAL };
 
@@ -75,12 +84,21 @@ struct Waypoint {
    logic in milliseconds instead of minutes. Defaults are the mission values. */
 struct Timings {
   std::chrono::milliseconds search_timeout{60000};
+  /* How long RECOVER_SLAM sweeps the camera looking for a view it can
+     relocalise against, before it gives up on the old map. */
   std::chrono::milliseconds slam_recover_timeout{10000};
+  /* How long it then waits for the reset backend to initialise a new map. */
+  std::chrono::milliseconds slam_reinit_timeout{10000};
   std::chrono::milliseconds slam_poll_interval{200};
   std::chrono::milliseconds waypoint_dwell{2000};
   std::chrono::milliseconds serial_retry_delay{1000};
   std::chrono::milliseconds obstacle_backoff{500};
+  std::chrono::milliseconds plan_retry_delay{500};
   int max_serial_retries = 5;
+  /* Consecutive NO_PATH answers before the waypoint is given up on. Each one
+     goes through recover_plan() first, so this is attempts at changing the
+     situation, not attempts at the same plan. */
+  int max_plan_retries = 8;
 };
 
 constexpr auto state_name(State s) -> const char * {
@@ -95,6 +113,7 @@ constexpr auto state_name(State s) -> const char * {
   case State::WAYPOINT_REACHED: return "WAYPOINT_REACHED";
   case State::RECOVER_SLAM: return "RECOVER_SLAM";
   case State::RECOVER_OBSTACLE: return "RECOVER_OBSTACLE";
+  case State::RECOVER_PLAN: return "RECOVER_PLAN";
   case State::FAULT_SERIAL: return "FAULT_SERIAL";
   case State::MISSION_DONE: return "MISSION_DONE";
   case State::MISSION_ABORT: return "MISSION_ABORT";
@@ -110,6 +129,7 @@ auto run(Actions &act, const Timings &t = Timings{}) -> int {
 
   State current_state = State::BOOT;
   int serial_retry_count = 0;
+  int plan_retry_count = 0;
   bool search_active = false;
   std::chrono::steady_clock::time_point search_started_at{};
 
@@ -137,6 +157,7 @@ auto run(Actions &act, const Timings &t = Timings{}) -> int {
 
   auto t_load_wp = taskflow
                        .emplace([&]() -> int {
+                         plan_retry_count = 0;
                          if (!act.load_waypoint()) {
                            go(State::MISSION_DONE);
                            return 0;
@@ -151,6 +172,7 @@ auto run(Actions &act, const Timings &t = Timings{}) -> int {
                            PlanResult pr = act.plan();
                            if (pr == PlanResult::PATH_FOUND) {
                              serial_retry_count = 0;
+                             plan_retry_count = 0;
                              go(State::TRAVERSE_PATH);
                              return 0;
                            }
@@ -158,6 +180,11 @@ auto run(Actions &act, const Timings &t = Timings{}) -> int {
                              go(State::FAULT_SERIAL);
                              return 3;
                            }
+                           if (pr == PlanResult::NO_PATH) {
+                             go(State::RECOVER_PLAN);
+                             return 4;
+                           }
+                           plan_retry_count = 0;
                            if (act.current_waypoint_type() ==
                                WaypointType::GPS_ONLY) {
                              go(State::WAYPOINT_REACHED);
@@ -245,12 +272,34 @@ auto run(Actions &act, const Timings &t = Timings{}) -> int {
                           })
                           .name("WAYPOINT_REACHED");
 
+  /* Stopping the rover was the one thing that could not help: a lost
+     backend needs a view it recognises, and a rover frozen facing whatever it
+     lost tracking on will never get one. Sweep the camera round slowly while
+     polling. If the old map never comes back, throw it away and let the
+     backend initialise a fresh one -- every leg re-projects its goal from GPS
+     and compass, so a new SLAM origin costs nothing but the local map, which
+     reset_slam() clears in step with it. */
   auto t_recover_slam =
       taskflow
           .emplace([&]() -> int {
             act.stop_motors();
             auto deadline =
                 std::chrono::steady_clock::now() + t.slam_recover_timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+              if (act.slam_tracking()) {
+                act.stop_motors();
+                go(State::PLAN_PATH);
+                return 0;
+              }
+              if (!act.slam_recover_step()) {
+                go(State::FAULT_SERIAL);
+                return 2;
+              }
+              std::this_thread::sleep_for(t.slam_poll_interval);
+            }
+            act.stop_motors();
+            act.reset_slam();
+            deadline = std::chrono::steady_clock::now() + t.slam_reinit_timeout;
             while (std::chrono::steady_clock::now() < deadline) {
               if (act.slam_tracking()) {
                 go(State::PLAN_PATH);
@@ -272,6 +321,31 @@ auto run(Actions &act, const Timings &t = Timings{}) -> int {
                              return 0;
                            })
                            .name("RECOVER_OBSTACLE");
+
+  /* A planner that finds nothing is told so, and something is changed before
+     it is asked again: the rover backs out of whatever it is boxed in by, or
+     looks around so the map has more in it, or the goal is brought closer.
+     Only after every attempt in the budget does the waypoint get skipped --
+     skipped, not the mission aborted, because the next waypoint may be
+     perfectly reachable and a rover parked in RED scores nothing. */
+  auto t_recover_plan = taskflow
+                            .emplace([&]() -> int {
+                              act.stop_motors();
+                              act.clear_path();
+                              if (++plan_retry_count > t.max_plan_retries) {
+                                act.on_waypoint_skipped();
+                                go(State::LOAD_WAYPOINT);
+                                return 1;
+                              }
+                              if (!act.recover_plan(plan_retry_count)) {
+                                go(State::FAULT_SERIAL);
+                                return 2;
+                              }
+                              std::this_thread::sleep_for(t.plan_retry_delay);
+                              go(State::PLAN_PATH);
+                              return 0;
+                            })
+                            .name("RECOVER_PLAN");
 
   auto t_fault_serial = taskflow
                             .emplace([&]() -> int {
@@ -304,14 +378,16 @@ auto run(Actions &act, const Timings &t = Timings{}) -> int {
   t_boot.precede(t_wait_map);
   t_wait_map.precede(t_load_wp);
   t_load_wp.precede(t_mission_done, t_plan_path);
-  t_plan_path.precede(t_traverse_path, t_wp_reached, t_search, t_fault_serial);
+  t_plan_path.precede(t_traverse_path, t_wp_reached, t_search, t_fault_serial,
+                      t_recover_plan);
   t_traverse_path.precede(t_plan_path, t_recover_obs, t_recover_slam,
                           t_fault_serial);
   t_search.precede(t_approach, t_wp_reached, t_search, t_fault_serial);
   t_approach.precede(t_wp_reached, t_search, t_fault_serial);
   t_wp_reached.precede(t_load_wp);
-  t_recover_slam.precede(t_plan_path, t_mission_abort);
+  t_recover_slam.precede(t_plan_path, t_mission_abort, t_fault_serial);
   t_recover_obs.precede(t_plan_path);
+  t_recover_plan.precede(t_plan_path, t_load_wp, t_fault_serial);
   t_fault_serial.precede(t_plan_path, t_mission_abort);
 
   executor.run(taskflow).wait();

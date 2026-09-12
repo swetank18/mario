@@ -34,6 +34,8 @@ struct ScriptedActions {
   std::deque<bool> detections;   // search_aruco / search_object
   std::deque<bool> scan_steps;   // false = serial write failed
   std::deque<bool> slam_health;  // for RECOVER_SLAM polling
+  std::deque<bool> recover_steps; // slam_recover_step: false = serial failed
+  std::deque<bool> recoveries;    // recover_plan: false = serial failed
   std::deque<Waypoint> queue;
 
   /* What an exhausted queue falls back to. Tests that need a detection to
@@ -46,6 +48,10 @@ struct ScriptedActions {
   int search_calls = 0;
   int stops = 0;
   int clears = 0;
+  int resets = 0;
+  int recover_steps_taken = 0;
+  int skipped = 0;
+  std::vector<int> recover_attempts;
   std::vector<LedColor> leds;
   bool done = false, aborted = false;
   State aborted_in = State::BOOT;
@@ -91,6 +97,16 @@ struct ScriptedActions {
   }
   bool search_scan_step() { return pop(scan_steps, true); }
   bool slam_tracking() { return pop(slam_health, true); }
+  bool slam_recover_step() {
+    recover_steps_taken++;
+    return pop(recover_steps, true);
+  }
+  void reset_slam() { resets++; }
+  bool recover_plan(int attempt) {
+    recover_attempts.push_back(attempt);
+    return pop(recoveries, true);
+  }
+  void on_waypoint_skipped() { skipped++; }
 
   void on_mission_done() { done = true; }
   void on_mission_abort(State in) {
@@ -111,10 +127,13 @@ static Timings fastTimings() {
   Timings t;
   t.search_timeout = std::chrono::milliseconds(120);
   t.slam_recover_timeout = std::chrono::milliseconds(60);
+  t.slam_reinit_timeout = std::chrono::milliseconds(60);
   t.slam_poll_interval = std::chrono::milliseconds(10);
   t.waypoint_dwell = std::chrono::milliseconds(1);
   t.serial_retry_delay = std::chrono::milliseconds(1);
   t.obstacle_backoff = std::chrono::milliseconds(1);
+  t.plan_retry_delay = std::chrono::milliseconds(1);
+  t.max_plan_retries = 3;
   return t;
 }
 
@@ -272,7 +291,43 @@ int main() {
     int rc = run(a, T);
     check(a.sawEdge("TRAVERSE_PATH->RECOVER_SLAM"), "FAULT_SLAM recovers");
     check(a.sawEdge("RECOVER_SLAM->PLAN_PATH"), "regained tracking replans");
+    check(a.recover_steps_taken == 2, "swept the camera while lost (got " +
+                                          std::to_string(a.recover_steps_taken) +
+                                          " steps)");
+    check(a.resets == 0, "kept the map once tracking came back");
     check(rc == 1, "mission completes");
+    record(a);
+  }
+
+  // ------------------------------------------------------------------------
+  std::printf("9b. SLAM sweep fails, reset brings it back\n");
+  {
+    ScriptedActions a;
+    a.queue = {wp(WaypointType::GPS_ONLY)};
+    a.plans = {PlanResult::PATH_FOUND, PlanResult::AT_GOAL};
+    a.traverses = {TraverseResult::FAULT_SLAM};
+    /* Lost for the whole sweep window, tracking again after the reset. */
+    for (int i = 0; i < 8; i++)
+      a.slam_health.push_back(false);
+    int rc = run(a, T);
+    check(a.resets == 1, "reset the backend once the sweep timed out");
+    check(a.sawEdge("RECOVER_SLAM->PLAN_PATH"), "fresh map replans");
+    check(rc == 1, "mission completes on the new map");
+    record(a);
+  }
+
+  // ------------------------------------------------------------------------
+  std::printf("9c. serial fails during the SLAM sweep\n");
+  {
+    ScriptedActions a;
+    a.queue = {wp(WaypointType::GPS_ONLY)};
+    a.plans = {PlanResult::PATH_FOUND, PlanResult::AT_GOAL};
+    a.traverses = {TraverseResult::FAULT_SLAM};
+    a.slam_health = {false};
+    a.recover_steps = {false};
+    int rc = run(a, T);
+    check(a.sawEdge("RECOVER_SLAM->FAULT_SERIAL"), "sweep write failure faults");
+    check(rc == 1, "and the serial retry carries on");
     record(a);
   }
 
@@ -287,8 +342,65 @@ int main() {
       a.slam_health.push_back(false);
     int rc = run(a, T);
     check(a.sawEdge("RECOVER_SLAM->MISSION_ABORT"), "gives up after the timeout");
+    check(a.resets == 1, "tried a reset before giving up");
     check(rc == 0 && a.aborted, "run() reports failure");
     check(a.aborted_in == State::MISSION_ABORT, "abort records the state");
+    record(a);
+  }
+
+  // ------------------------------------------------------------------------
+  std::printf("10b. no path: recover, replan, succeed\n");
+  {
+    ScriptedActions a;
+    a.queue = {wp(WaypointType::GPS_ONLY)};
+    a.plans = {PlanResult::NO_PATH, PlanResult::NO_PATH, PlanResult::PATH_FOUND,
+               PlanResult::AT_GOAL};
+    a.traverses = {TraverseResult::REACHED};
+    int rc = run(a, T);
+    check(a.sawEdge("PLAN_PATH->RECOVER_PLAN"), "NO_PATH recovers");
+    check(!a.sawEdge("PLAN_PATH->FAULT_SERIAL"),
+          "and does not touch the serial fault path");
+    check(a.sawEdge("RECOVER_PLAN->PLAN_PATH"), "replans after recovering");
+    check(a.recover_attempts == std::vector<int>{1, 2},
+          "recover_plan told which attempt this is");
+    check(a.clears == 2, "stale path dropped each time");
+    check(a.skipped == 0 && rc == 1, "waypoint reached, mission completes");
+    record(a);
+  }
+
+  // ------------------------------------------------------------------------
+  std::printf("10c. no path forever: skip the waypoint, finish the rest\n");
+  {
+    ScriptedActions a;
+    a.queue = {wp(WaypointType::GPS_ONLY), wp(WaypointType::GPS_ONLY)};
+    /* max_plan_retries recoveries, then one more NO_PATH spends the budget. */
+    for (int i = 0; i < T.max_plan_retries + 1; i++)
+      a.plans.push_back(PlanResult::NO_PATH);
+    a.plans.push_back(PlanResult::AT_GOAL); // the second waypoint is trivial
+    int rc = run(a, T);
+    check(a.sawEdge("RECOVER_PLAN->LOAD_WAYPOINT"), "budget spent, moves on");
+    check(a.skipped == 1, "one waypoint reported skipped");
+    check((int)a.recover_attempts.size() == T.max_plan_retries,
+          "exactly max_plan_retries recoveries were attempted");
+    int reached = 0;
+    for (auto s : a.visited)
+      if (s == State::WAYPOINT_REACHED)
+        reached++;
+    check(reached == 1, "the other waypoint still gets reached");
+    check(rc == 1 && !a.aborted, "mission completes rather than aborting");
+    record(a);
+  }
+
+  // ------------------------------------------------------------------------
+  std::printf("10d. serial fails inside plan recovery\n");
+  {
+    ScriptedActions a;
+    a.queue = {wp(WaypointType::GPS_ONLY)};
+    a.plans = {PlanResult::NO_PATH, PlanResult::AT_GOAL};
+    a.recoveries = {false};
+    int rc = run(a, T);
+    check(a.sawEdge("RECOVER_PLAN->FAULT_SERIAL"), "recovery write failure faults");
+    check(rc == 1, "serial retry carries on");
     record(a);
   }
 
@@ -404,7 +516,12 @@ int main() {
         "WAYPOINT_REACHED->LOAD_WAYPOINT",
         "RECOVER_SLAM->PLAN_PATH",
         "RECOVER_SLAM->MISSION_ABORT",
+        "RECOVER_SLAM->FAULT_SERIAL",
         "RECOVER_OBSTACLE->PLAN_PATH",
+        "PLAN_PATH->RECOVER_PLAN",
+        "RECOVER_PLAN->PLAN_PATH",
+        "RECOVER_PLAN->LOAD_WAYPOINT",
+        "RECOVER_PLAN->FAULT_SERIAL",
         "FAULT_SERIAL->PLAN_PATH",
         "FAULT_SERIAL->MISSION_ABORT",
     };
@@ -417,7 +534,8 @@ int main() {
         State::TRAVERSE_PATH,    State::SEARCH_TARGET,
         State::APPROACH_TARGET,  State::WAYPOINT_REACHED,
         State::RECOVER_SLAM,     State::RECOVER_OBSTACLE,
-        State::FAULT_SERIAL,     State::MISSION_DONE,
+        State::RECOVER_PLAN,     State::FAULT_SERIAL,
+        State::MISSION_DONE,
         State::MISSION_ABORT};
     for (auto s : all)
       check(g_states.count(s) > 0, std::string("state ") + state_name(s));

@@ -53,6 +53,11 @@ public:
 
   void log(const rerun::RecordingStream &rec) const;
 
+  /* Back to the state it was constructed in: every cell unknown, centred on
+     the origin. For a SLAM reset -- the new pose frame shares nothing with
+     the old one, so a map built in the old one is not stale, it is wrong. */
+  void clear();
+
   const MapParams &params() const { return params_; }
 
   /* Ground plane the last integrate() measured, in metres above the wheel

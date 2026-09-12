@@ -421,6 +421,76 @@ public:
     spdlog::info("State Machine: mission complete");
   }
 
+  auto on_waypoint_skipped() -> void {
+    spdlog::error(std::format("State Machine: giving up on waypoint lat={} "
+                              "lon={} -- no path after every recovery",
+                              current_waypoint.lat, current_waypoint.lon));
+    plan_failures_ = 0;
+  }
+
+  /* One step of the SLAM recovery sweep: a slow turn on the spot, so the
+     camera passes over views the backend may recognise. Slow, because
+     relocalisation needs sharp frames and the rover may be next to whatever
+     it lost tracking against. */
+  auto slam_recover_step() -> bool {
+    tarzan::tarzan_msg msg =
+        tarzan::get_tarzan_msg(0.0f, (float)(drive_cmd.angular_z * 0.25));
+    return serial::write_msg<struct tarzan::tarzan_msg>(
+               serial, msg, tarzan::TARZAN_MSG_LEN) ==
+           serial::Error::WriteSuccess;
+  }
+
+  /* Throw away the SLAM map and the occupancy map together: the new pose
+     frame has a new origin, so a map built in the old one is not merely
+     stale. The mission survives this because every plan() re-projects its
+     goal from the GPS fix and compass heading of the moment; nothing
+     upstream of here remembers the old frame. */
+  auto reset_slam() -> void {
+    spdlog::warn("State Machine: SLAM did not relocalise -- resetting the "
+                 "backend and clearing the map");
+    poseState.invalidate();
+    backend_.reset();
+    map_.clear();
+    current_path.reset();
+    obstacle_trips_ = 0;
+  }
+
+  /* Change something before plan() is asked again. Attempt 1 gives the map
+     a moment to fill in; after that, back out if the rover is boxed in, and
+     otherwise turn so the camera puts new ground on the map. plan() also
+     brings the local goal in by half for every failure in a row, so a goal
+     that landed in a pocket of rocks is retried nearer and nearer. */
+  auto recover_plan(int attempt) -> bool {
+    slam::Pose pose;
+    const bool boxed_in =
+        poseState.get(pose) &&
+        map_.clearance(pose.x, pose.y) < planner_params_.safety_margin;
+    spdlog::warn("State Machine: plan recovery {} ({})", attempt,
+                 boxed_in ? "boxed in, backing out"
+                 : attempt == 1 ? "waiting for the map"
+                                : "turning to look around");
+    if (attempt == 1 && !boxed_in) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      return true;
+    }
+    if (boxed_in)
+      return escape_stall();
+
+    const auto turn_until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+    while (std::chrono::steady_clock::now() < turn_until) {
+      tarzan::tarzan_msg msg =
+          tarzan::get_tarzan_msg(0.0f, (float)(drive_cmd.angular_z * 0.5));
+      if (serial::write_msg<struct tarzan::tarzan_msg>(
+              serial, msg, tarzan::TARZAN_MSG_LEN) !=
+          serial::Error::WriteSuccess)
+        return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    stop_motors();
+    return true;
+  }
+
   auto on_mission_abort(State in) -> void {
     spdlog::error(std::format("State Machine: aborted in {}", state_name(in)));
   }
@@ -821,8 +891,18 @@ public:
     auto [local_x, local_y] = get_local_goal(geo_msg.geo_data, target_latitude,
                                              target_longitude, pose);
 
+    /* Every failure in a row halves the hop. A goal that landed behind a
+       boulder field is retried a little nearer each time until the planner
+       can see a way to it; a success puts the full reach back. */
+    if (plan_failures_ > 0) {
+      const double scale = std::pow(0.5, std::min(plan_failures_, 3));
+      local_x = pose.x + (local_x - pose.x) * scale;
+      local_y = pose.y + (local_y - pose.y) * scale;
+    }
+
     auto path = planner_.plan({pose.x, pose.y}, {local_x, local_y});
     if (!path) {
+      plan_failures_++;
       /* Which end refused matters and the old line did not say. A* will not
          leave a start cell inside safety_margin of an obstacle, and it will
          not accept a goal in one either, and the two want completely
@@ -835,9 +915,10 @@ public:
                    map_.clearance(local_x, local_y),
                    map_.occupied(local_x, local_y),
                    planner_params_.safety_margin);
-      return PlanResult::FAULT;
+      return PlanResult::NO_PATH;
     }
 
+    plan_failures_ = 0;
     current_path = std::move(path);
     return PlanResult::PATH_FOUND;
   }
@@ -846,6 +927,8 @@ public:
      traverse() returns on every trip, so this cannot live in its loop. */
   int obstacle_trips_ = 0;
   double last_trip_x_ = 1e9, last_trip_y_ = 1e9;
+  /* Consecutive plan() calls that found nothing; scales the next hop. */
+  int plan_failures_ = 0;
 
 public:
   nav::OccupancyMap &map_;

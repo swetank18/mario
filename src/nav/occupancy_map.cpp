@@ -48,6 +48,22 @@ OccupancyMap::OccupancyMap(const MapParams &params)
   frame_.assign(cells, NAN);
 }
 
+void OccupancyMap::clear() {
+  std::unique_lock<std::shared_mutex> lock(mtx_);
+
+  /* setGeometry re-centres on the origin and blanks every layer to NaN. */
+  map_.setGeometry(grid_map::Length(params_.dim[0], params_.dim[1]),
+                   params_.resolution);
+  map_.convertToDefaultStartIndex();
+
+  const size_t cells = map_.getSize()(0) * map_.getSize()(1);
+  distance_.assign(cells, kUnreached);
+  frame_.assign(cells, NAN);
+  has_obstacles_ = false;
+  integrations_ = 0;
+  ground_level_ = 0.0f;
+}
+
 void OccupancyMap::recenter(double x, double y) {
   std::unique_lock<std::shared_mutex> lock(mtx_);
 

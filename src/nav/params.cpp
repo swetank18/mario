@@ -33,6 +33,7 @@ MapParams loadMapParams(const std::string &filename) {
   read(grid_map, "layer_name", params.layer_name);
   read(grid_map, "frame_id", params.frame_id);
   read(grid_map, "unknown_is_occupied", params.unknown_is_occupied);
+  read(grid_map, "unknown_cost", params.unknown_cost);
   read(grid_map, "elevation_retain", params.elevation_retain);
   read(grid_map, "forget_after", params.forget_after);
 
@@ -57,6 +58,16 @@ MapParams loadMapParams(const std::string &filename) {
     read(offset, "y", params.lidar_offset[1]);
     read(offset, "z", params.lidar_offset[2]);
   }
+  auto read_fov = [&](const char *key, SensorFov &fov) {
+    if (!sensor || !sensor[key])
+      return;
+    const YAML::Node node = sensor[key];
+    read(node, "h_deg", fov.h_deg);
+    read(node, "v_deg", fov.v_deg);
+    read(node, "range", fov.range);
+  };
+  read_fov("fov", params.sensor_fov);
+  read_fov("lidar_fov", params.lidar_fov);
 
   const YAML::Node ground = config["ground"];
   read(ground, "estimate", params.estimate_ground);

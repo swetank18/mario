@@ -32,7 +32,7 @@ constexpr float kImplausibleGround = 1.0f;
 
 OccupancyMap::OccupancyMap(const MapParams &params)
     : params_(params), layer_(params.layer_name),
-      age_layer_(params.layer_name + "_seen_at") {
+      miss_layer_(params.layer_name + "_misses"), fov_(params.sensor_fov) {
   map_.setFrameId(params_.frame_id);
   map_.setGeometry(grid_map::Length(params_.dim[0], params_.dim[1]),
                    params_.resolution);
@@ -41,7 +41,7 @@ OccupancyMap::OccupancyMap(const MapParams &params)
      ground are different things, and unknown_is_occupied is what decides
      between them -- the old map initialised to 0.0 and so could never tell. */
   map_.add(layer_, NAN);
-  map_.add(age_layer_, NAN);
+  map_.add(miss_layer_, NAN);
 
   const size_t cells = map_.getSize()(0) * map_.getSize()(1);
   distance_.assign(cells, kUnreached);
@@ -62,6 +62,11 @@ void OccupancyMap::clear() {
   has_obstacles_ = false;
   integrations_ = 0;
   ground_level_ = 0.0f;
+}
+
+void OccupancyMap::setFieldOfView(const SensorFov &fov) {
+  std::unique_lock<std::shared_mutex> lock(mtx_);
+  fov_ = fov;
 }
 
 void OccupancyMap::recenter(double x, double y) {
@@ -186,46 +191,98 @@ void OccupancyMap::integrate(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
 
   integrations_++;
 
+  /* Where the sensor is looking from, for the forgetting test below. The
+     elevation layer is measured from the estimated ground plane, so the
+     sensor's height goes into the same frame. */
+  const Eigen::Matrix<double, 4, 4> T_world_sensor = T_flat * T_base_sensor;
+  const double sx = T_world_sensor(0, 3);
+  const double sy = T_world_sensor(1, 3);
+  const double sensor_height =
+      T_world_sensor(2, 3) - (params_.estimate_ground ? ground_level_ : 0.0);
+  const double yaw = std::atan2(T_flat(1, 0), T_flat(0, 0));
+  double range = fov_.range;
+  if (range <= 0.0) {
+    /* Unset: as far as the passthrough lets points in, else the map edge. */
+    const auto x_limits = params_.pass_filter.find("x");
+    range = x_limits != params_.pass_filter.end()
+                ? x_limits->second[1]
+                : std::min(params_.dim[0], params_.dim[1]) / 2.0;
+  }
+
   for (grid_map::GridMapIterator it(map_); !it.isPastEnd(); ++it) {
     const grid_map::Index index = *it;
     const float observed = frame_[index(0) * cols + index(1)];
-    if (std::isnan(observed))
-      continue;
-
     float &cell = map_.at(layer_, index);
-    /* Blend rather than keep the extreme of all time. A cell that once held a
-       team-mate walking the course used to keep them as a wall until the
-       process restarted; now the ground they were standing on wins back the
-       cell over the next few frames. */
-    cell = std::isnan(cell)
-               ? observed
-               : params_.elevation_retain * cell +
-                     (1.0f - params_.elevation_retain) * observed;
-    map_.at(age_layer_, index) = static_cast<float>(integrations_);
+    float &misses = map_.at(miss_layer_, index);
+
+    if (!std::isnan(observed)) {
+      /* Blend rather than keep the extreme of all time. A cell that once held
+         a team-mate walking the course used to keep them as a wall until the
+         process restarted; now the ground they were standing on wins back
+         the cell over the next few frames. */
+      cell = std::isnan(cell)
+                 ? observed
+                 : params_.elevation_retain * cell +
+                       (1.0f - params_.elevation_retain) * observed;
+      misses = 0.0f;
+      continue;
+    }
+
+    /* The other half of not keeping obstacles forever: a cell the sensor has
+       stopped seeing eventually goes back to unknown instead of asserting
+       stale geometry at a planner that has since driven past it.
+
+       Nothing came back from this cell. That is only evidence of anything if
+       the sensor was pointed at it: a forward camera turning away from a
+       boulder has not seen it vanish, and neither has one whose lowest ray
+       passes over the top of it. The old rule aged every cell on every
+       frame regardless, so with a 55-degree camera and forget_after 40 a
+       rock beside the rover was gone from the map 2.7 s after the rover
+       turned, and A* planned straight through where it had just been. */
+    if (std::isnan(cell) || params_.forget_after <= 0)
+      continue;
+    if (!couldHaveSeen(index, cell, sx, sy, sensor_height, yaw, range))
+      continue;
+    if (++misses > params_.forget_after) {
+      cell = NAN;
+      misses = NAN;
+    }
   }
 
-  forgetStaleCells();
   rebuildDistanceField();
 }
 
-void OccupancyMap::forgetStaleCells() {
-  /* The other half of not keeping obstacles forever: a cell the sensor has
-     stopped seeing eventually goes back to unknown instead of asserting stale
-     geometry at a planner that has since driven past it. */
-  if (params_.forget_after <= 0)
-    return;
+bool OccupancyMap::couldHaveSeen(const grid_map::Index &index, float elevation,
+                                 double sx, double sy, double sensor_height,
+                                 double yaw, double range) const {
+  grid_map::Position at;
+  if (!map_.getPosition(index, at))
+    return false;
 
-  for (grid_map::GridMapIterator it(map_); !it.isPastEnd(); ++it) {
-    const grid_map::Index index = *it;
-    const float seen_at = map_.at(age_layer_, index);
-    if (std::isnan(seen_at))
-      continue;
-    if (integrations_ - static_cast<int>(seen_at) <= params_.forget_after)
-      continue;
+  const double dx = at.x() - sx;
+  const double dy = at.y() - sy;
+  const double r = std::hypot(dx, dy);
+  if (r > range || r < 1e-6)
+    return false;
 
-    map_.at(layer_, index) = NAN;
-    map_.at(age_layer_, index) = NAN;
+  if (fov_.h_deg < 360.0f) {
+    double bearing = std::atan2(dy, dx) - yaw;
+    while (bearing > M_PI)
+      bearing -= 2.0 * M_PI;
+    while (bearing < -M_PI)
+      bearing += 2.0 * M_PI;
+    if (std::abs(bearing) > fov_.h_deg * M_PI / 360.0)
+      return false;
   }
+
+  /* The ray to what the cell holds, not to the ground under it: a 0.6 m rock
+     a metre ahead is in view when the ground it stands on is not. */
+  if (fov_.v_deg < 180.0f) {
+    const double pitch = std::atan2(elevation - sensor_height, r);
+    if (std::abs(pitch) > fov_.v_deg * M_PI / 360.0)
+      return false;
+  }
+  return true;
 }
 
 void OccupancyMap::dropNullReturns(
@@ -285,7 +342,7 @@ bool OccupancyMap::isObstacle(float elevation) const {
 
 double OccupancyMap::costOf(float elevation) const {
   if (std::isnan(elevation))
-    return params_.unknown_is_occupied ? kImpassable : 0.0;
+    return params_.unknown_is_occupied ? kImpassable : params_.unknown_cost;
   if (isObstacle(elevation))
     return kImpassable;
 

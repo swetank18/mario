@@ -377,6 +377,97 @@ int main(int argc, char **argv) {
     }
   }
 
+  std::printf("\n5. a boulder the camera has turned away from is remembered\n");
+  {
+    /* Same leg, then a quarter turn on the spot with the rocks off to the
+       side of the camera's wedge, held for three times forget_after. With
+       one forward camera this is the commonest way to lose an obstacle: the
+       old rule aged every cell on every frame whether or not it was in view,
+       so the rocks were gone 2.7 s after the turn and A* planned through
+       them. Run once with the configured FOV and once with the all-seeing
+       default, which reproduces the old rule, to show the difference is the
+       FOV and not the frame count. */
+    auto rocksSurvive = [&](const nav::MapParams &params) {
+      nav::OccupancyMap map(params);
+      for (int i = 0; i <= 40; i++) {
+        const Pose2D pose{i * 0.1, 0.0, 0.0};
+        map.recenter(pose.x, pose.y);
+        map.integrate(render(cam, pose, offset).cloud, worldFromBase(pose),
+                      T_base_sensor);
+      }
+      const bool seen_before =
+          map.occupied(5.65, 1.5) && map.occupied(5.65, -1.5);
+      for (int i = 0; i < 3 * params.forget_after; i++) {
+        const Pose2D pose{4.0, 0.0, M_PI / 2.0};
+        map.recenter(pose.x, pose.y);
+        map.integrate(render(cam, pose, offset).cloud, worldFromBase(pose),
+                      T_base_sensor);
+      }
+      const bool seen_after =
+          map.occupied(5.65, 1.5) && map.occupied(5.65, -1.5);
+      return std::make_pair(seen_before, seen_after);
+    };
+
+    const auto with_fov = rocksSurvive(map_params);
+    check(with_fov.first, "both rocks mapped before the turn");
+    check(with_fov.second,
+          "both still mapped after facing away for 3x forget_after frames");
+
+    nav::MapParams all_seeing = map_params;
+    all_seeing.sensor_fov = nav::SensorFov{};
+    const auto without = rocksSurvive(all_seeing);
+    check(without.first && !without.second,
+          "control: with no FOV the old rule forgets them, so the FOV is "
+          "what keeps them");
+  }
+
+  std::printf("\n6. ground under the camera's lowest ray is not aged out\n");
+  {
+    /* From 0.62 m up with a 42.5-degree vertical spread the camera cannot
+       see flat ground inside about 1.6 m of itself. A cell there that was
+       mapped on the way in must not be forgotten just because the camera is
+       now looking over the top of it. */
+    nav::OccupancyMap map(map_params);
+    for (int i = 0; i <= 40; i++) {
+      const Pose2D pose{i * 0.1, 0.0, 0.0};
+      map.recenter(pose.x, pose.y);
+      map.integrate(render(cam, pose, offset).cloud, worldFromBase(pose),
+                    T_base_sensor);
+    }
+    const double cost_before = map.traversal_cost(4.8, 0.0);
+    for (int i = 0; i < 3 * map_params.forget_after; i++) {
+      const Pose2D pose{4.0, 0.0, 0.0};
+      map.integrate(render(cam, pose, offset).cloud, worldFromBase(pose),
+                    T_base_sensor);
+    }
+    const double cost_after = map.traversal_cost(4.8, 0.0);
+    std::printf("     cell 0.8 m ahead: cost %.1f before the wait, %.1f after "
+                "(unknown would be %.1f)\n",
+                cost_before, cost_after, map_params.unknown_cost);
+    check(cost_before == 0.0, "the cell was mapped as clean ground on the way in");
+    check(cost_after == 0.0, "and is still clean ground after sitting still");
+  }
+
+  std::printf("\n7. unexplored ground costs more than ground that was looked at\n");
+  {
+    nav::OccupancyMap map(map_params);
+    for (int i = 0; i <= 40; i++) {
+      const Pose2D pose{i * 0.1, 0.0, 0.0};
+      map.recenter(pose.x, pose.y);
+      map.integrate(render(cam, pose, offset).cloud, worldFromBase(pose),
+                    T_base_sensor);
+    }
+    const double seen = map.traversal_cost(7.0, 0.0);
+    const double behind = map.traversal_cost(-3.0, 0.0);
+    std::printf("     seen flat ground %.1f, never-seen ground %.1f\n", seen,
+                behind);
+    check(seen == 0.0, "ground the camera measured flat is free");
+    check(behind == map_params.unknown_cost && behind > 0.0,
+          "ground it never looked at costs unknown_cost");
+    check(behind < nav::kImpassable, "but is not refused outright");
+    check(!map.occupied(-3.0, 0.0), "and occupied() still says it may be entered");
+  }
+
   std::printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
               failures, failures == 1 ? "" : "s");
   return failures ? 1 : 0;

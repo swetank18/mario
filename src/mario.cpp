@@ -225,6 +225,10 @@ auto mapping(nav::OccupancyMap &occupancy_map,
      obstacle. The 0.40 m of forward offset was missing too, which put every
      rock 40 cm nearer than it really was. */
   Eigen::Affine3d T_base_sensor = Eigen::Affine3d::Identity();
+  /* Which sensor's wedge the map should reason about when a cell returns
+     nothing: out of view is not the same as seen to be empty. */
+  occupancy_map.setFieldOfView(use_lidar ? occupancy_map.params().lidar_fov
+                                         : occupancy_map.params().sensor_fov);
   if (use_lidar) {
     /* A lidar cloud is already in the base FLU convention -- x forward, y
        left, z up -- so the mount is the whole transform and the rotation

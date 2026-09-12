@@ -21,11 +21,17 @@ grid_map:
   # true refuses most goals until coverage improves. Team call, not a default
   # to flip casually.
   unknown_is_occupied: false
+  # What routing through a never-seen cell costs, on top of the distance, when
+  # they are not refused. Lets A* prefer ground it has actually looked at
+  # where it has the choice; with one forward camera it usually does not.
+  unknown_cost: 2.0
   # How much of a cell's stored elevation survives a fresh look at it. The map
   # used to keep the most extreme value ever written, so anything that moved
   # through the scene left a wall that only a restart cleared.
   elevation_retain: 0.6
-  # Integrations a cell may go unobserved before it reverts to unknown.
+  # Looks at a cell that come back empty before it reverts to unknown. Only a
+  # frame the cell was actually in view for counts -- see sensor.fov below --
+  # so a boulder the camera has turned away from is kept, not aged out.
   forget_after: 40
   # Graded cost for ground that is passable but not flat, for the three bands
   # below pos_obstacle_threshold h: (h/2, h], (h/4, h/2], flatter than h/4.
@@ -54,6 +60,19 @@ sensor:
     x: 0.0
     y: 0.0
     z: 0.90
+  # What each sensor can see from its mount, so the map knows whether a cell
+  # that returned nothing was looked at and found empty or simply out of view.
+  # Camera: MarioRover.proto fieldOfView 0.9566 rad = 54.8 deg across 640 px;
+  # square pixels make it 2*atan(240/617.2) = 42.5 deg down 480. range unset
+  # falls back to the passthrough x limit.
+  fov:
+    h_deg: 54.8
+    v_deg: 42.5
+  # Lidar: 16 layers over 30 degrees, all the way round, 40 m.
+  lidar_fov:
+    h_deg: 360.0
+    v_deg: 30.0
+    range: 40.0
 
 # Re-measure the ground plane from each cloud and threshold relative to it,
 # rather than trusting z = 0 to be the ground. Rough terrain and SLAM z-drift

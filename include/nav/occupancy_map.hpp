@@ -58,6 +58,11 @@ public:
      the old one, so a map built in the old one is not stale, it is wrong. */
   void clear();
 
+  /* Which sensor's view the forgetting logic should reason about. Defaults to
+     params().sensor_fov; the mapping thread switches it to lidar_fov when it
+     is building from the scanner. */
+  void setFieldOfView(const SensorFov &fov);
+
   const MapParams &params() const { return params_; }
 
   /* Ground plane the last integrate() measured, in metres above the wheel
@@ -83,7 +88,11 @@ private:
   bool isObstacle(float elevation) const;
   double costOf(float elevation) const;
   void rebuildDistanceField();
-  void forgetStaleCells();
+  /* Whether the sensor, from where it is now, could have returned something
+     from `cell`'s stored content. False means a miss there is not evidence. */
+  bool couldHaveSeen(const grid_map::Index &index, float elevation,
+                     double sx, double sy, double sensor_height, double yaw,
+                     double range) const;
   void boundsLocked(double &min_x, double &min_y, double &max_x,
                     double &max_y) const;
   bool lookup(double x, double y, float &elevation) const;
@@ -91,10 +100,12 @@ private:
   MapParams params_;
   grid_map::GridMap map_;
   std::string layer_;
-  /* Integration index at which each cell was last observed, as a grid_map
-     layer rather than a side vector so that move() scrolls it in step with
-     the elevation and blanks whatever comes into view. */
-  std::string age_layer_;
+  /* Consecutive looks at each cell that came back empty, as a grid_map layer
+     rather than a side vector so that move() scrolls it in step with the
+     elevation and blanks whatever comes into view. NaN where the cell has
+     never been observed at all. */
+  std::string miss_layer_;
+  SensorFov fov_;
   /* Cells to the nearest obstacle, one entry per cell in row-major order.
      Rebuilt after every integrate so clearance() is a lookup instead of the
      scan over an obstacle list it used to be -- A* asks for it once per

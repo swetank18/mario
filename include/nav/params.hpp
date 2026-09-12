@@ -7,6 +7,21 @@
 
 namespace nav {
 
+/* What a sensor can see from where it is mounted: horizontal and vertical
+   field of view in degrees, and how far out it is trusted, in metres.
+   `range` 0 means "as far as the passthrough filter lets points in".
+
+   This is what decides whether a cell that got no return this frame was
+   *looked at* and found empty, or simply was not in view. A forward-facing
+   depth camera turning away from a boulder should not forget it, and a
+   camera 0.62 m up with a 42-degree vertical spread cannot see flat ground
+   inside 1.6 m of itself at all, so a miss there says nothing. */
+struct SensorFov {
+  float h_deg = 360.0f;
+  float v_deg = 180.0f;
+  float range = 0.0f;
+};
+
 /* Everything the mapping side reads out of the gridmap config. Every field is
    defaulted, so a config written before the split still loads. */
 struct MapParams {
@@ -24,6 +39,13 @@ struct MapParams {
      old behaviour, where unobserved ground read as flat and the planner drove
      straight through it. */
   bool unknown_is_occupied = false;
+  /* What it costs to route through a never-observed cell when they are not
+     refused outright. 0 is the old behaviour, where unexplored ground was as
+     good as ground measured flat and A* could not prefer either. Positive
+     makes explored ground cheaper where there is a choice, and still lets a
+     leg into the unknown when there is not -- which, with one forward camera,
+     is every leg. */
+  float unknown_cost = 2.0f;
 
   /* Where the depth sensor sits in the rover's base FLU frame, in metres:
      x forward, y left, z above the wheel contact plane. On the sim rover the
@@ -44,6 +66,11 @@ struct MapParams {
      cloud is already FLU, so its extrinsic is a pure translation. */
   float lidar_offset[3] = {0.0f, 0.0f, 0.0f};
 
+  /* Fields of view for the two, see SensorFov. The defaults see everything
+     in range, which is what the map assumed before it knew any better. */
+  SensorFov sensor_fov;
+  SensorFov lidar_fov;
+
   /* Rough terrain and SLAM z-drift both move the apparent ground plane, and
      the obstacle thresholds are only +/-0.25 m. Re-estimating the local
      ground from each cloud and thresholding relative to it is what
@@ -62,8 +89,9 @@ struct MapParams {
 
      `elevation_retain` is how much of the old value survives a fresh
      observation of the same cell (0 = trust the newest cloud completely,
-     1 = never update). `forget_after` is how many integrations a cell may go
-     unobserved before it reverts to unknown. */
+     1 = never update). `forget_after` is how many *looks* at a cell may come
+     back empty before it reverts to unknown -- looks, not integrations: a
+     frame the cell was not in view for does not count against it. */
   float elevation_retain = 0.6f;
   int forget_after = 40;
 

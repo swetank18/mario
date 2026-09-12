@@ -101,6 +101,15 @@ struct tarzan_msg {
   uint32_t crc;
 };
 
+/* The wire layout is whatever the compiler makes of these structs, on both
+   ends: the Nucleo firmware and the sim bridge both include this header and
+   send sizeof() bytes. Four doubles followed by a uint32 pads to 40, not 36,
+   on every ABI in use here (x86-64, AArch64, ARM EABI all align double to
+   8). Pinned so that a change to either struct, or a build that packs them,
+   fails here rather than as CRC errors on the rover. */
+static_assert(sizeof(tarzan_msg) == 12, "tarzan_msg wire layout changed");
+static_assert(sizeof(geodetic_msg) == 40, "geodetic_msg wire layout changed");
+
 constexpr size_t TARZAN_MSG_LEN = sizeof(tarzan_msg) + 2; // tarzan message len
 constexpr size_t GEODETIC_MSG_LEN =
     sizeof(geodetic_msg) + 2; // geodetic message len

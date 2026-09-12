@@ -1,0 +1,80 @@
+# Grid map / planner parameters for the REAL rover with the RealSense D435i.
+# Same schema as sim/config/gridmap_sim.yaml (read by nav::loadMapParams and
+# nav::loadPlannerParams in src/nav/params.cpp); every key is optional and
+# falls back to include/nav/params.hpp.
+#
+# Three numbers in here are guesses until someone puts a tape measure on the
+# chassis. They are marked MEASURE. Getting sensor.offset wrong is the single
+# worst mapping bug this project has had -- every square metre of ground
+# mapped as a ditch -- so do it before the first field run, not after.
+
+grid_map:
+  x: 20.0
+  y: 20.0
+  resolution: 0.10
+  min_grid_points: 3
+  pos_obstacle_threshold: 0.25
+  neg_obstacle_threshold: -0.25
+  unknown_is_occupied: false
+  unknown_cost: 2.0
+  elevation_retain: 0.6
+  # Looks at a cell that come back empty before it reverts to unknown. Only a
+  # frame the cell was in the D435i's view for counts (sensor.fov below).
+  # 60 at 30 Hz is 2 s of looking at where something was.
+  forget_after: 60
+  rough_cost: [5.0, 1.0, 0.0]
+
+sensor:
+  # MEASURE. Where the D435i's left imager (the depth origin) sits relative to
+  # the point on the ground midway between the wheels: x forward, y left,
+  # z up, metres. The sim value is 0.40/0/0.62; the real mast is not the sim
+  # mast. If OccupancyMap logs "ground plane measured at N m" with N far from
+  # zero, this is what is wrong.
+  offset:
+    x: 0.40
+    y: 0.0
+    z: 0.62
+  # D435i depth stream: 87 x 58 degrees (Intel's spec, +/-3). Trusted to 6 m:
+  # the stereo baseline is 50 mm and outdoors in daylight the projector adds
+  # nothing, so depth past that is noise the passthrough below also drops.
+  fov:
+    h_deg: 87.0
+    v_deg: 58.0
+    range: 6.0
+
+ground:
+  estimate: true
+  window: 5.0
+  max_height: 0.25
+
+filters:
+  min_filtering_points: 100
+  passthrough_filter:
+    x:
+      min_limit: 0.3
+      max_limit: 6.0
+    y:
+      min_limit: -5.0
+      max_limit: 5.0
+    z:
+      min_limit: -1.0
+      max_limit: 2.0
+  voxel_size:
+    x: 0.05
+    y: 0.05
+    z: 0.05
+
+planner:
+  time_to_solve: 1.0
+  # MEASURE. Radius of the circle that contains the whole rover -- wheel to
+  # opposite wheel, corner to corner, whichever is furthest from the centre --
+  # about the point midway between the wheels. traverse()'s obstacle trip wire
+  # and the planner's margin both come from this.
+  rover_radius: 0.55
+  # At least rover_radius (loadPlannerParams raises it if not). The extra is
+  # the allowance for pose error; SLAM was ~6 cm in the sim, expect worse.
+  safety_margin: 0.70
+  goal_tolerance: 0.15
+  obstacle_cost_weight: 2.0
+  terrain_cost_weight: 0.2
+  turn_penalty: 0.1

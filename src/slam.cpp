@@ -97,6 +97,10 @@ int main() {
   const auto rec = rerun::RecordingStream("TEAM RUDRA AUTONOMOUS - mario");
 
   struct utils::rs_handler *rs_ptr = utils::setupRealsense(realsense_config);
+  if (!rs_ptr) {
+    spdlog::error("slam_test: no RealSense attached");
+    return 1;
+  }
 
   struct slam::slamHandle *slam_handler = new slam::slamHandle();
 
@@ -108,7 +112,15 @@ int main() {
   Eigen::Matrix<double, 4, 4> res;
 
   while (true) {
-    rs2::frame frame = rs_ptr->frame_q.wait_for_frame();
+    /* Bounded: a camera that enumerates but never delivers -- wrong USB
+       port, another process holding it -- used to park this here forever. */
+    rs2::frame frame;
+    try {
+      frame = rs_ptr->frame_q.wait_for_frame(5000);
+    } catch (const rs2::error &) {
+      spdlog::error("slam_test: no frame from the RealSense in 5 s");
+      return 1;
+    }
 
     if (rs2::frameset fs = frame.as<rs2::frameset>()) {
 

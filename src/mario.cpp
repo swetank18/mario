@@ -1,9 +1,13 @@
 #include <array>
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
 #include <chrono>
+#include <filesystem>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <format>
 #include <fstream>
@@ -66,6 +70,14 @@ struct mapReadySignal {
   bool flag = false;
 } map_sync;
 
+/* Cleared once the mission ends. The worker threads used to loop on
+   `while (true)`, so main() joined them forever and the process had to be
+   killed from outside -- sim/record_mission.sh watches the log rather than
+   the process for exactly that reason. Every blocking call in the workers
+   now has a timeout so they notice this within a second. */
+std::atomic<bool> g_running{true};
+constexpr int kRecvTimeoutMs = 500;
+
 /* How close to a post URC wants the rover to finish. approach() aims to stop
    inside this by a margin (approach_stop_m); this is the hard line it will
    not let a target slip out of the frame beyond. */
@@ -77,10 +89,14 @@ auto capture_frame(struct utils::rs_handler *rs_ptr, zmq::socket_t &pub)
 
   rs2::frame frame;
 
-  while (true) {
+  while (g_running) {
     int ret;
 
-    frame = rs_ptr->frame_q.wait_for_frame();
+    try {
+      frame = rs_ptr->frame_q.wait_for_frame(kRecvTimeoutMs);
+    } catch (const rs2::error &) {
+      continue; // timed out; check g_running and wait again
+    }
 
     if (rs2::frameset fs = frame.as<rs2::frameset>()) {
       auto aligned_frames = rs_ptr->align.process(fs);
@@ -195,7 +211,7 @@ auto localize(slam::Backend &backend,
     return msg.empty() ? std::string("<timeout>") : msg[0].to_string();
   };
 
-  while (true) {
+  while (g_running) {
     colorFrameMsg.clear();
     depthFrameMsg.clear();
     timestampMsg.clear();
@@ -301,7 +317,7 @@ auto mapping(nav::OccupancyMap &occupancy_map,
 
   Eigen::Affine3d T_world_base = Eigen::Affine3d::Identity();
 
-  while (true) {
+  while (g_running) {
 
     pointcloud_msg.clear();
 
@@ -786,6 +802,16 @@ public:
   }
 
   auto search_object() -> bool {
+    if (!detector) {
+      /* No model was loaded, so this search can only time out into partial
+         credit. Say so once rather than 60 s of silence. */
+      if (!warned_no_detector_) {
+        spdlog::warn("search: no object detector loaded; the object waypoint "
+                     "will fall through on the search timeout");
+        warned_no_detector_ = true;
+      }
+      return false;
+    }
     std::vector<zmq::message_t> msgs;
     if (!recv_latest(color_sub, msgs))
       return false;
@@ -846,6 +872,8 @@ public:
   }
 
   auto approach() -> ApproachResult {
+    if (current_waypoint.type == WaypointType::GPS_OBJECT && !detector)
+      return ApproachResult::LOST_TARGET;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     int lost_frames = 0;
     uint64_t previous = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1048,6 +1076,7 @@ public:
   double last_trip_x_ = 1e9, last_trip_y_ = 1e9;
   /* Consecutive plan() calls that found nothing; scales the next hop. */
   int plan_failures_ = 0;
+  bool warned_no_detector_ = false;
 
 public:
   nav::OccupancyMap &map_;
@@ -1109,8 +1138,11 @@ int main(int argc, char *argv[]) {
       "gnss", po::value<std::string>(), "file path of gnss targets")(
       "linear", po::value<float>(), "max linear velocity")(
       "angular", po::value<float>(), "max angular velocity")(
-      "yolo_model", po::value<std::string>(), "path to YOLO ONNX model")(
-      "yolo_labels", po::value<std::string>(), "path to YOLO class labels")(
+      "yolo_model", po::value<std::string>()->default_value(""),
+      "path to YOLO ONNX model. Optional: without one, object waypoints "
+      "cannot be detected and fall through on the search timeout")(
+      "yolo_labels", po::value<std::string>()->default_value(""),
+      "path to YOLO class labels")(
       "sim", po::bool_switch(),
       "simulation mode: frames come from an external publisher (the Webots "
       "mario_bridge controller) instead of an attached RealSense")(
@@ -1141,9 +1173,8 @@ int main(int argc, char *argv[]) {
 
   /* Everything below reads these with vm[...].as<>(), which throws on a
      missing option rather than telling you which one you forgot. */
-  for (const char *opt :
-       {"serial", "br", "rerun_ip", "gridmap_config", "p", "i", "d", "gnss",
-        "linear", "angular", "yolo_model", "yolo_labels"}) {
+  for (const char *opt : {"serial", "br", "rerun_ip", "gridmap_config", "p",
+                          "i", "d", "gnss", "linear", "angular"}) {
     if (!vm.count(opt)) {
       spdlog::error("Missing required option: --{}", opt);
       return -1;
@@ -1211,10 +1242,31 @@ int main(int argc, char *argv[]) {
       control::initPid(vm["p"].as<double>(), vm["i"].as<double>(),
                        vm["d"].as<double>());
 
-  /* yolo detector */
-  YOLO8Detector *detector =
-      new YOLO8Detector(vm["yolo_model"].as<std::string>(),
-                        vm["yolo_labels"].as<std::string>());
+  /* yolo detector. Optional: the tree ships no model, and a rover that
+     cannot look for the object can still drive the course and find the
+     marker. Constructing YOLO8Detector on a missing file throws from inside
+     onnxruntime, which used to be how every run without a model ended. */
+  YOLO8Detector *detector = nullptr;
+  {
+    const std::string model = vm["yolo_model"].as<std::string>();
+    const std::string labels = vm["yolo_labels"].as<std::string>();
+    if (model.empty()) {
+      spdlog::warn("No --yolo_model given: object waypoints will search and "
+                   "time out");
+    } else if (!std::filesystem::exists(model)) {
+      spdlog::error("YOLO model {} does not exist; running without a detector",
+                    model);
+    } else {
+      try {
+        detector = new YOLO8Detector(model, labels);
+        spdlog::info("YOLO detector loaded from {}", model);
+      } catch (const std::exception &e) {
+        spdlog::error("YOLO model {} failed to load: {}; running without a "
+                      "detector",
+                      model, e.what());
+      }
+    }
+  }
 
   /* CONFIGURING PERIPHERALS */
   spdlog::info("Configuring Rover Peripherals...");
@@ -1230,6 +1282,38 @@ int main(int argc, char *argv[]) {
       return -1;
     }
     spdlog::info("Successful setup of Realsense");
+
+    /* stella_vslam tracks on the intrinsics in its YAML, which were typed in
+       from one particular D435i. Every unit is calibrated differently at the
+       factory, and a wrong fx puts every landmark at the wrong depth, which
+       comes out as scale drift the map cannot tell from real motion. The
+       device knows its own numbers; say if the config disagrees. */
+    const rs2_intrinsics &ci = realsense_config.color_i;
+    spdlog::info("Realsense colour intrinsics: {}x{} fx {:.1f} fy {:.1f} "
+                 "cx {:.1f} cy {:.1f}",
+                 ci.width, ci.height, ci.fx, ci.fy, ci.ppx, ci.ppy);
+    try {
+      const YAML::Node cam =
+          YAML::LoadFile(vm["slam_config"].as<std::string>())["Camera"];
+      const double fx = cam["fx"].as<double>(), fy = cam["fy"].as<double>();
+      const double cx = cam["cx"].as<double>(), cy = cam["cy"].as<double>();
+      const int cols = cam["cols"].as<int>(), rows = cam["rows"].as<int>();
+      auto off = [](double a, double b) { return std::abs(a - b) / b > 0.02; };
+      if (cols != ci.width || rows != ci.height)
+        spdlog::error("slam_config says {}x{} but the camera streams {}x{}",
+                      cols, rows, ci.width, ci.height);
+      if (off(fx, ci.fx) || off(fy, ci.fy) || off(cx, ci.ppx) ||
+          off(cy, ci.ppy))
+        spdlog::warn("slam_config intrinsics (fx {:.1f} fy {:.1f} cx {:.1f} "
+                     "cy {:.1f}) differ from this camera's by more than 2%. "
+                     "Put the numbers above into {} -- SLAM scale depends on "
+                     "them.",
+                     fx, fy, cx, cy, vm["slam_config"].as<std::string>());
+    } catch (const std::exception &e) {
+      spdlog::warn("could not read Camera intrinsics from slam_config: {}",
+                   e.what());
+    }
+
     rs2::frame frame;
     for (int i = 0; i < 100; i++) {
       frame = rs_ptr->frame_q.wait_for_frame();
@@ -1276,6 +1360,11 @@ int main(int argc, char *argv[]) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
+
+  /* Bounded waits, so the workers can notice g_running going false. */
+  slam_sub.set(zmq::sockopt::rcvtimeo, kRecvTimeoutMs);
+  mapping_sub.set(zmq::sockopt::rcvtimeo, kRecvTimeoutMs);
+  color_sub.set(zmq::sockopt::rcvtimeo, kRecvTimeoutMs);
 
   try {
     slam_sub.connect(zmq_endpoint);
@@ -1328,7 +1417,7 @@ int main(int argc, char *argv[]) {
     }
     std::string line;
     while (std::getline(gnss_file, line)) {
-      if (line.empty())
+      if (line.empty() || line[0] == '#')
         continue;
       std::istringstream ss(line);
       double lat, lon;
@@ -1351,9 +1440,10 @@ int main(int argc, char *argv[]) {
   }
   spdlog::info(std::format("Loaded {} GNSS waypoints", sm.waypoints.size()));
 
-  sm.run();
+  const int mission_ok = sm.run();
 
   /* CLEANUP */
+  g_running = false;
   if (capture_thread.joinable())
     capture_thread.join();
   localize_thread.join();
@@ -1365,5 +1455,23 @@ int main(int argc, char *argv[]) {
     utils::destroyHandle(rs_ptr);
   serial::close(serial);
 
-  return 0;
+  spdlog::info("mario: exiting ({})", mission_ok ? "mission done" : "aborted");
+
+  /* Everything that matters is joined and closed above; what remains is the
+     destructors, and one of them can block: the Rerun stream's tries to
+     shut its gRPC client down gracefully, and against a peer that accepts
+     the connection but never answers -- a frozen viewer, or a stand-in that
+     only drains bytes -- it waits forever, and stella_vslam's shutdown never
+     runs behind it. Seen on the first run that got this far: "mission
+     complete" logged, process still alive minutes later. The result is
+     already decided, so let the orderly way out have ten seconds and then
+     take the door with the same code. _Exit skips the remaining destructors
+     on purpose; nothing left at that point holds anything worth flushing. */
+  const int exit_code = mission_ok ? 0 : 2;
+  std::thread([exit_code] {
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    std::fputs("mario: shutdown stalled for 10 s -- exiting hard\n", stderr);
+    std::_Exit(exit_code);
+  }).detach();
+  return exit_code;
 }

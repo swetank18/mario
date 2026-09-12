@@ -130,7 +130,14 @@ int main(int argc, char *argv[]) {
                           .count();
   while (true) {
     // fetch frames from realsense
-    frame = rs_ptr->frame_q.wait_for_frame();
+    /* Bounded, for the same reason as slam.cpp: a camera that enumerates
+       but never delivers used to park this here forever. */
+    try {
+      frame = rs_ptr->frame_q.wait_for_frame(5000);
+    } catch (const rs2::error &) {
+      std::cout << "pid_test: no frame from the RealSense in 5 s\n";
+      return -1;
+    }
 
     if (rs2::frameset fs = frame.as<rs2::frameset>()) {
       auto aligned_frames = rs_ptr->align.process(fs);

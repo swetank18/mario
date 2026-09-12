@@ -6,15 +6,22 @@
 #
 # record_run.sh is the older, dependency-free equivalent: it drives fsm_drive,
 # which follows GPS bearings and needs neither SLAM nor a grid map. This one
-# runs the actual autonomy stack -- stella_vslam, the lidar occupancy map, A*
-# and the FSM -- so it needs the full build and a Rerun viewer.
+# runs the actual autonomy stack -- stella_vslam, the occupancy map, A* and
+# the FSM -- so it needs the full build and something listening where a Rerun
+# viewer would (mario exits at startup otherwise; a plain TCP accept is
+# enough, see RERUN_IP below).
+#
+# The video is the rover's own camera, depth and lidar off the ZMQ bus
+# (sim/tools/record_stream.py), not a screen grab: on an XWayland session
+# x11grab of the Webots window records black.
 #
 # Environment:
 #   MARIO_BIN     path to the binary          (default build-rel/mario)
 #   RERUN_IP      viewer address              (default 127.0.0.1:9876)
-#   CLOUD_SOURCE  lidar | depth               (default lidar)
-#   YOLO_MODEL    ONNX detector               (see KNOWN_ISSUES issue 9)
-#   REC_FPS       capture frame rate          (default 20)
+#   CLOUD_SOURCE  depth | lidar               (default depth -- the D435i is
+#                                              the sensor the real rover has)
+#   YOLO_MODEL    ONNX detector, optional     (none: object waypoint times out)
+#   REC_FPS       capture frame rate          (default 15)
 #   MISSION_MAX   seconds before giving up    (default 600)
 set -uo pipefail
 
@@ -28,23 +35,21 @@ PTY_LINK="/tmp/mario_serial"
 ENDPOINT="tcp://127.0.0.1:5599"
 MARIO_BIN="${MARIO_BIN:-$REPO_DIR/build-rel/mario}"
 RERUN_IP="${RERUN_IP:-127.0.0.1:9876}"
-CLOUD_SOURCE="${CLOUD_SOURCE:-lidar}"
-DISPLAY_ID="${DISPLAY:-:0}"
-FPS="${REC_FPS:-20}"
+CLOUD_SOURCE="${CLOUD_SOURCE:-depth}"
+FPS="${REC_FPS:-15}"
 MISSION_MAX="${MISSION_MAX:-600}"
-SIZE="${REC_SIZE:-$(xdpyinfo -display "$DISPLAY_ID" 2>/dev/null | awk '/dimensions:/{print $2}')}"
-SIZE="${SIZE:-1920x1080}"
+PYTHON="${PYTHON:-python3}"
 
 command -v ffmpeg >/dev/null || { echo "!! ffmpeg not installed" >&2; exit 1; }
 [[ -x "$MARIO_BIN" ]] || { echo "!! $MARIO_BIN not built" >&2; exit 1; }
 
-WEBOTS_PID=""; FFMPEG_PID=""; MARIO_PID=""
+WEBOTS_PID=""; REC_PID=""; MARIO_PID=""
 cleanup() {
   [[ -n "$MARIO_PID"  ]] && kill "$MARIO_PID"  2>/dev/null
-  # SIGINT, not SIGKILL: ffmpeg has to write the moov atom or the mp4 is
-  # unplayable.
-  [[ -n "$FFMPEG_PID" ]] && kill -INT "$FFMPEG_PID" 2>/dev/null
-  sleep 2
+  # SIGINT, not SIGKILL: the recorder has to close its ffmpeg or the mp4 has
+  # no moov atom and is unplayable.
+  [[ -n "$REC_PID" ]] && kill -INT "$REC_PID" 2>/dev/null
+  sleep 3
   [[ -n "$WEBOTS_PID" ]] && kill "$WEBOTS_PID" 2>/dev/null
   wait 2>/dev/null
 }
@@ -61,23 +66,21 @@ if ! (exec 3<>"/dev/tcp/${RERUN_IP%%:*}/${RERUN_IP##*:}") 2>/dev/null; then
   exit 1
 fi
 
-echo ">> starting webots (GUI, realtime)"
+echo ">> starting webots (realtime)"
 rm -f "$PTY_LINK"
-# Realtime and windowed. Not --minimize: there is nothing to film if the 3D
-# view is not being drawn. Not --mode=fast either -- traverse() and approach()
-# take their PID dt from the wall clock.
+# Realtime. Not --mode=fast: traverse() and approach() take their PID dt from
+# the wall clock, and fast mode floods the pty faster than mario drains it.
 webots --batch --mode=realtime --stdout --stderr "$WORLD" >"$LOG.webots" 2>&1 &
 WEBOTS_PID=$!
 
 for _ in $(seq 1 90); do [[ -e "$PTY_LINK" ]] && break; sleep 0.5; done
 [[ -e "$PTY_LINK" ]] || { echo "!! bridge never came up; see $LOG.webots" >&2; exit 1; }
-sleep 5   # let the first frames, the lidar and the GUI settle
+sleep 5   # let the first frames and the lidar settle
 
-echo ">> recording $SIZE @ ${FPS}fps -> $OUT"
-ffmpeg -y -loglevel error -f x11grab -framerate "$FPS" -video_size "$SIZE" \
-       -i "$DISPLAY_ID" -c:v libx264 -preset veryfast -crf 23 \
-       -pix_fmt yuv420p "$OUT" &
-FFMPEG_PID=$!
+echo ">> recording the camera stream @ ${FPS}fps -> $OUT"
+"$PYTHON" "$SIM_DIR/tools/record_stream.py" "$OUT" --endpoint "$ENDPOINT" \
+       --fps "$FPS" --seconds "$((MISSION_MAX + 30))" >"$LOG.rec" 2>&1 &
+REC_PID=$!
 sleep 2
 
 echo ">> running the mission ($CLOUD_SOURCE map)"
@@ -96,28 +99,27 @@ stdbuf -o0 "$MARIO_BIN" \
   --marker_size 0.336 \
   --p 1.2 --i 0.0 --d 0.05 \
   --linear 0.6 --angular 1.0 \
-  --yolo_model "${YOLO_MODEL:-$REPO_DIR/model/yolov8n.onnx}" \
+  --yolo_model "${YOLO_MODEL:-}" \
   --yolo_labels "$REPO_DIR/model/labels.names" >"$LOG" 2>&1 &
 MARIO_PID=$!
 
-# mario's worker threads loop forever, so it never returns even once the
-# mission is done (KNOWN_ISSUES open issue 7). Watch the log for the end of
-# the run instead of waiting on the process.
+# mario exits on its own now, 0 for MISSION_DONE and 2 for an abort.
 deadline=$((SECONDS + MISSION_MAX))
-while (( SECONDS < deadline )); do
-  if grep -q "mission complete" "$LOG" 2>/dev/null; then
-    echo ">> mission complete"
-    sleep 3
-    break
-  fi
-  if grep -q "aborted in" "$LOG" 2>/dev/null; then
-    echo "!! mission aborted -- see $LOG"
-    sleep 3
-    break
-  fi
-  kill -0 "$MARIO_PID" 2>/dev/null || { echo "!! mario exited early"; break; }
+while (( SECONDS < deadline )) && kill -0 "$MARIO_PID" 2>/dev/null; do
   sleep 2
 done
+if kill -0 "$MARIO_PID" 2>/dev/null; then
+  echo "!! mission still running after ${MISSION_MAX}s -- stopping it"
+else
+  wait "$MARIO_PID"; rc=$?
+  case $rc in
+    0) echo ">> mission complete" ;;
+    2) echo "!! mission aborted -- see $LOG" ;;
+    *) echo "!! mario exited with $rc -- see $LOG" ;;
+  esac
+fi
+MARIO_PID=""
+sleep 3
 
 grep -E "State:|mission complete|aborted in" "$LOG" | tail -20
 echo ">> video: $OUT"

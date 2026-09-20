@@ -1007,6 +1007,65 @@ public:
     return ApproachResult::LOST_TARGET;
   }
 
+  /* How long plan() waits for the Nucleo to report a fix before calling the
+     link faulty. Frames still arriving, just without a position, is the
+     receiver still acquiring; FAULT_SERIAL retries after that, so a cold
+     receiver gets a few minutes in all before the mission aborts. */
+  std::chrono::seconds gps_fix_timeout{30};
+
+  /* The newest fix the Nucleo has, waited for if it has none yet. A dead
+     link -- nothing arriving, or frames that do not decode -- is reported as
+     the link error it is; frames that arrive without a fix are waited on,
+     motors stopped, until the deadline. plan() used to take the first frame
+     it got: with the receiver still cold that was lat 0 lon 0, a goal ten
+     thousand kilometres away, clamped to one hop in a meaningless direction
+     and driven. */
+  auto read_fix(struct tarzan::geodetic &fix) -> bool {
+    const auto started = std::chrono::steady_clock::now();
+    auto next_log = started;
+    bool stopped = false;
+    for (;;) {
+      struct tarzan::geodetic_msg geo_msg{};
+      serial::Error err = serial::read_msg<struct tarzan::geodetic_msg>(
+          serial, &geo_msg, tarzan::GEODETIC_MSG_LEN);
+      if (err != serial::ReadSuccess) {
+        spdlog::error("plan: {}", serial::get_error(err));
+        if (err == serial::CrcError)
+          spdlog::error("plan: frame carries crc {:#010x}, computed {:#010x} "
+                        "over {} bytes -- the Nucleo computes its CRC "
+                        "differently",
+                        geo_msg.crc, serial::crc_of(geo_msg),
+                        offsetof(tarzan::geodetic_msg, crc));
+        return false;
+      }
+      if (tarzan::has_fix(geo_msg.geo_data)) {
+        fix = geo_msg.geo_data;
+        return true;
+      }
+      /* The last twist written may still be in effect: REPLAN_TIMEOUT hands
+         straight back to PLAN_PATH without stopping. */
+      if (!stopped) {
+        stop_motors();
+        stopped = true;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now - started > gps_fix_timeout) {
+        spdlog::error("plan: no GPS fix in {} s (Nucleo reports lat {} lon {} "
+                      "head {})",
+                      gps_fix_timeout.count(), geo_msg.geo_data.lat,
+                      geo_msg.geo_data.lon, geo_msg.geo_data.head);
+        return false;
+      }
+      if (now >= next_log) {
+        spdlog::warn("plan: waiting for a GPS fix (Nucleo reports lat {} "
+                     "lon {} head {})",
+                     geo_msg.geo_data.lat, geo_msg.geo_data.lon,
+                     geo_msg.geo_data.head);
+        next_log = now + std::chrono::seconds(5);
+      }
+    }
+  }
+
   auto plan() -> PlanResult {
     slam::Pose pose;
     if (!poseState.get(pose)) {
@@ -1014,35 +1073,24 @@ public:
       return PlanResult::FAULT;
     }
 
-    struct tarzan::geodetic_msg geo_msg{};
-    serial::Error err = serial::read_msg<struct tarzan::geodetic_msg>(
-        serial, &geo_msg, tarzan::GEODETIC_MSG_LEN);
-    if (err != serial::ReadSuccess) {
-      spdlog::error("plan: {}", serial::get_error(err));
-      if (err == serial::CrcError)
-        spdlog::error("plan: frame carries crc {:#010x}, computed {:#010x} "
-                      "over {} bytes -- the Nucleo computes its CRC "
-                      "differently",
-                      geo_msg.crc, serial::crc_of(geo_msg),
-                      offsetof(tarzan::geodetic_msg, crc));
+    struct tarzan::geodetic fix;
+    if (!read_fix(fix))
       return PlanResult::FAULT;
-    }
 
     double target_latitude = current_waypoint.lat;
     double target_longitude = current_waypoint.lon;
 
-    double dLat = DEG2RAD(target_latitude - geo_msg.geo_data.lat);
-    double dLon = DEG2RAD(target_longitude - geo_msg.geo_data.lon);
-    double x_east =
-        dLon * std::cos(DEG2RAD(geo_msg.geo_data.lat)) * EARTH_RADIUS;
+    double dLat = DEG2RAD(target_latitude - fix.lat);
+    double dLon = DEG2RAD(target_longitude - fix.lon);
+    double x_east = dLon * std::cos(DEG2RAD(fix.lat)) * EARTH_RADIUS;
     double y_north = dLat * EARTH_RADIUS;
     double total_distance = std::sqrt((x_east * x_east) + (y_north * y_north));
 
     if (total_distance < 2.0)
       return PlanResult::AT_GOAL;
 
-    auto [local_x, local_y] = get_local_goal(geo_msg.geo_data, target_latitude,
-                                             target_longitude, pose);
+    auto [local_x, local_y] =
+        get_local_goal(fix, target_latitude, target_longitude, pose);
 
     /* Every failure in a row halves the hop. A goal that landed behind a
        boulder field is retried a little nearer each time until the planner

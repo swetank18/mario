@@ -170,9 +170,9 @@ if(BUILD_TESTS)
                                 ${CMAKE_SOURCE_DIR}/sim/config/gridmap_sim.yaml)
 
   # serial frame test -- read_msg over a pty pair, frames written from the
-  # other end: the geodetic CRC check and the skip-and-retry around it.
-  # serial_test above is the bench tool for a real Nucleo; this is what runs
-  # without one, and the only way to hand read_msg a corrupt frame.
+  # other end: the geodetic CRC check and the skip-and-retry around it, and
+  # has_fix. serial_test above is the bench tool for a real Nucleo; this is
+  # what runs without one, and the only way to hand read_msg a corrupt frame.
   add_executable(serial_frame_test test/serial_frame_test.cpp)
   target_link_libraries(serial_frame_test PRIVATE serial Threads::Threads)
   add_test(NAME serial_frame COMMAND serial_frame_test)

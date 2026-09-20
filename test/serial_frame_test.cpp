@@ -1,7 +1,8 @@
 /* Drives serial::read_msg over a pty pair, the way the Webots bridge feeds
  * mario, with frames written from the other end: the CRC check and the
- * skip-and-retry around it. Nothing else exercises it without a Nucleo on
- * the bench, and a Nucleo cannot be told to corrupt a frame on demand.
+ * skip-and-retry around it, and tarzan::has_fix. Nothing else exercises
+ * either without a Nucleo on the bench, and a Nucleo cannot be told to
+ * corrupt a frame on demand.
  */
 
 #include "serial.hpp"
@@ -74,6 +75,19 @@ int main() {
     check(g.crc != serial::crc32_ieee((const uint8_t *)&g,
                                       sizeof g - sizeof g.crc),
           "geodetic_msg: sizeof - sizeof(crc) would be a different number");
+  }
+
+  /* --- has_fix ------------------------------------------------------------ */
+  std::printf("  has_fix\n");
+  {
+    check(tarzan::has_fix({38.406, -110.792, 1400.0, 90.0}), "a fix is a fix");
+    check(!tarzan::has_fix({0.0, 0.0, 0.0, 0.0}), "lat 0 lon 0 is no fix");
+    check(!tarzan::has_fix({NAN, -110.792, 0.0, 90.0}), "NaN latitude");
+    check(!tarzan::has_fix({38.406, -110.792, 0.0, NAN}), "NaN heading");
+    check(!tarzan::has_fix({91.0, -110.792, 0.0, 90.0}), "latitude past 90");
+    check(!tarzan::has_fix({38.406, 181.0, 0.0, 90.0}), "longitude past 180");
+    check(tarzan::has_fix({0.0, -110.792, 0.0, 90.0}),
+          "the equator itself is still a fix");
   }
 
   /* --- read_msg over a pty ------------------------------------------------ */

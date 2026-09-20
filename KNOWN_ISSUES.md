@@ -51,6 +51,21 @@ defined, and URC scores the light.
 
 ## Fixed
 
+### `plan()` navigated on whatever the Nucleo sent, fix or no fix
+
+The Nucleo streams `geodetic_msg` from power-up, and before the receiver has
+a fix that is zeros, typically, or NaN. `plan()` took the first frame it
+got, computed a goal ten thousand kilometres away, clamped it to one hop in
+whatever direction that happened to be, and drove. The sim never showed it
+because the bridge's GPS always has a fix. `tarzan::has_fix()` rejects
+non-finite values, anything outside the range a latitude or longitude can
+have, and (0, 0); `read_fix()` stops the motors and waits up to
+`gps_fix_timeout` (30 s) for a frame that passes, logging what the Nucleo is
+reporting every 5 s, and only then answers `FAULT` -- which FAULT_SERIAL
+retries five times, so a cold receiver gets a few minutes in all. A link
+that sends nothing, or frames that do not decode, is still the immediate
+fault it was. `test/serial_frame_test.cpp` covers the predicate.
+
 ### The geodetic CRC was never checked
 
 `read_msg()` COBS-decoded the frame and returned it; nothing between the

@@ -64,7 +64,8 @@ enum class TraverseResult {
 /* NO_PATH and FAULT used to be one value, and the graph sent both to
    FAULT_SERIAL: five retries against a perfectly healthy link and then a
    mission abort, over a planner that just needed the rover to back up or the
-   map to fill in. FAULT is now strictly the serial link. */
+   map to fill in. FAULT is now strictly the serial link: dead, or carrying
+   no GPS fix. */
 enum class PlanResult { PATH_FOUND, AT_GOAL, NO_PATH, FAULT };
 
 enum class ApproachResult { ARRIVED, LOST_TARGET, FAULT_SERIAL };

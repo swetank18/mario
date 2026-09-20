@@ -2,6 +2,7 @@
 #define SERIAL_HPP
 
 #include <boost/asio.hpp>
+#include <cmath>
 #include <cobs.h>
 #include <cstddef>
 #include <cstdint>
@@ -116,6 +117,19 @@ struct geodetic_msg {
   struct geodetic geo_data;
   uint32_t crc;
 };
+
+/* Whether a geodetic frame carries a position worth navigating on. The
+   Nucleo streams before the receiver has a fix -- zeros, typically, or NaN
+   -- and plan() used to take whatever came: a goal ten thousand kilometres
+   away, clamped to one hop in a meaningless direction, and driven. (0, 0)
+   is a real place in the Gulf of Guinea that no course is at, so it counts
+   as no fix, along with anything non-finite or outside the range a latitude
+   or longitude can have. */
+inline bool has_fix(const struct geodetic &g) {
+  return std::isfinite(g.lat) && std::isfinite(g.lon) &&
+         std::isfinite(g.head) && std::abs(g.lat) <= 90.0 &&
+         std::abs(g.lon) <= 180.0 && !(g.lat == 0.0 && g.lon == 0.0);
+}
 
 /* msg for Tarzan msg */
 struct DiffDriveTwist {

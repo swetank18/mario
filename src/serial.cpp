@@ -253,7 +253,10 @@ int main(int argc, char *argv[]) {
       continue;
     }
     std::cout << "lat : " << geo_msg.geo_data.lat
-              << " lon : " << geo_msg.geo_data.lon << std::endl;
+              << " lon : " << geo_msg.geo_data.lon
+              << " head : " << geo_msg.geo_data.head
+              << (tarzan::has_fix(geo_msg.geo_data) ? "" : "   (NO FIX)")
+              << std::endl;
   }
 }
 #endif

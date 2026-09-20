@@ -51,6 +51,21 @@ defined, and URC scores the light.
 
 ## Fixed
 
+### The geodetic CRC was never checked
+
+`read_msg()` COBS-decoded the frame and returned it; nothing between the
+wire and `plan()` looked at the `crc` field, so a frame mangled in transit
+was navigated on as long as it was the right length. It is verified now,
+over the bytes before the field -- `offsetof(msg, crc)`, which for
+`geodetic_msg` is 32 and not the 36 that `sizeof - sizeof(crc)` gives,
+because of the tail padding; the sim bridge already used that span and
+`crc_of()` makes it the one spelling on this side too. A mismatch skips the
+frame and takes the next, since the newest in the backlog may be the one the
+wire damaged; three in a row is `CrcError`, which is a peer computing a
+different CRC, and `serial_test` prints the two numbers so that is found on
+the bench and not in the field. `test/serial_frame_test.cpp` drives it over
+a pty pair.
+
 ### The SLAM pose was the camera's, and everything downstream treated it as the body's
 
 `StellaBackend::track()` applies `kCameraToBase`, the optical-to-FLU

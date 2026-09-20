@@ -3,6 +3,7 @@
 
 #include <boost/asio.hpp>
 #include <cobs.h>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <stdint.h>
@@ -17,8 +18,24 @@ enum Error : uint8_t {
   CobsEncodeError,
   CobsDecodeError,
   AsioWriteError,
-  AsioReadError
+  AsioReadError,
+  CrcError
 };
+
+uint32_t crc32_ieee(const uint8_t *data, size_t len);
+
+uint32_t crc32_ieee_update(uint32_t crc, const uint8_t *data, size_t len);
+
+/* The CRC of a wire struct covers every byte before its crc field. That is
+   not sizeof(msg) - sizeof(crc): the two agree for tarzan_msg (12 bytes, crc
+   at 8) and differ for geodetic_msg (40 bytes, crc at 32, four bytes of
+   padding after it), where the subtraction folds the crc field itself into
+   what it covers. The sim bridge computes it this way; the Nucleo firmware
+   has to as well, and serial_test says so when it does not. */
+template <typename msg_type> uint32_t crc_of(const msg_type &msg) {
+  return crc32_ieee(reinterpret_cast<const uint8_t *>(&msg),
+                    offsetof(msg_type, crc));
+}
 
 /* Writes a whole COBS frame, blocking until every byte has gone out. */
 Error writeFrame(serial_port *serial, const uint8_t msg[], size_t MSG_LEN);
@@ -44,33 +61,43 @@ Error write_msg(serial_port *serial, const msgType &msg, size_t MSG_LEN) {
    included. Blocks until one is available or the port times out. */
 Error readFrame(serial_port *serial, uint8_t *read_buffer, size_t MSG_LEN);
 
+/* On CrcError, buffer still holds the last frame decoded, so the caller can
+   show the two numbers that disagree. */
 template <typename msg_type>
 Error read_msg(serial_port *serial, msg_type *buffer, size_t MSG_LEN) {
 
   uint8_t read_buffer[MSG_LEN];
-  if (Error err = readFrame(serial, read_buffer, MSG_LEN);
-      err != Error::ReadSuccess) {
-    return err;
+  /* A frame whose CRC does not match is skipped, the way a frame of the
+     wrong length is: the newest one in the backlog may be the one the wire
+     mangled, and the next is at most a Nucleo period away. It used to be
+     trusted -- nothing between the COBS decode and plan() looked at the
+     field -- so a corrupted fix was navigated on. Three in a row is not
+     line noise; that is the peer computing a different CRC, and the caller
+     hears about it. */
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (Error err = readFrame(serial, read_buffer, MSG_LEN);
+        err != Error::ReadSuccess) {
+      return err;
+    }
+
+    if (auto result = cobs_decode(reinterpret_cast<void *>(buffer), MSG_LEN-2,
+                                  reinterpret_cast<const void *>(read_buffer),
+                                  MSG_LEN-1);
+        result.status != COBS_DECODE_OK) {
+      return Error::CobsDecodeError;
+    }
+
+    if (crc_of(*buffer) == buffer->crc)
+      return Error::ReadSuccess;
   }
 
-  if (auto result = cobs_decode(reinterpret_cast<void *>(buffer), MSG_LEN-2,
-                                reinterpret_cast<const void *>(read_buffer),
-                                MSG_LEN-1);
-      result.status != COBS_DECODE_OK) {
-    return Error::CobsDecodeError;
-  }
-
-  return Error::ReadSuccess;
+  return Error::CrcError;
 }
 
 void close(serial_port *serial);
 
 serial_port *open(io_context &io, const std::string port,
                   unsigned int baudrate);
-
-uint32_t crc32_ieee(const uint8_t *data, size_t len);
-
-uint32_t crc32_ieee_update(uint32_t crc, const uint8_t *data, size_t len);
 
 const char *get_error(enum Error err);
 }; // namespace serial

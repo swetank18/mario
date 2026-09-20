@@ -188,6 +188,9 @@ const char *get_error(enum Error err) {
   case Error::AsioReadError:
     return "Asio Serial Read Error";
     break;
+  case Error::CrcError:
+    return "Serial CRC Mismatch";
+    break;
   };
   return "Undefined Error";
 }
@@ -202,8 +205,9 @@ struct tarzan_msg get_tarzan_msg(float linear_x, float angular_z) {
   struct DiffDriveTwist cmd = {.linear_x = linear_x, .angular_z = angular_z};
 
   msg.cmd = cmd;
-  msg.crc = serial::crc32_ieee(
-      (uint8_t *)&msg, sizeof(struct tarzan::tarzan_msg) - sizeof(msg.crc));
+  /* Used to be sizeof(msg) - sizeof(msg.crc): the same span for this
+     struct, and the wrong one for geodetic_msg -- see crc_of. */
+  msg.crc = serial::crc_of(msg);
 
   // tarzan msg
   return msg;
@@ -230,11 +234,24 @@ int main(int argc, char *argv[]) {
     std::cout << "info : " << message << std::endl;
 
     // read data
-    struct tarzan::geodetic_msg geo_msg;
+    struct tarzan::geodetic_msg geo_msg{};
     err = serial::read_msg<struct tarzan::geodetic_msg>(
         nucleo, &geo_msg, tarzan::GEODETIC_MSG_LEN);
-    if (err == serial::AsioReadError || err == serial::CobsDecodeError)
-      std::cout << serial::get_error(err);
+    if (err == serial::CrcError) {
+      /* The decoded frame is still in geo_msg, so the two numbers that
+         disagree can be shown. A firmware that covers a different span
+         fails every frame, and this is where to find that out. */
+      std::cout << "crc mismatch: frame carries 0x" << std::hex << geo_msg.crc
+                << ", computed 0x" << serial::crc_of(geo_msg) << std::dec
+                << " over " << offsetof(tarzan::geodetic_msg, crc)
+                << " bytes -- the Nucleo computes its CRC differently"
+                << std::endl;
+      continue;
+    }
+    if (err != serial::ReadSuccess) {
+      std::cout << serial::get_error(err) << std::endl;
+      continue;
+    }
     std::cout << "lat : " << geo_msg.geo_data.lat
               << " lon : " << geo_msg.geo_data.lon << std::endl;
   }

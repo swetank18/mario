@@ -1014,11 +1014,17 @@ public:
       return PlanResult::FAULT;
     }
 
-    struct tarzan::geodetic_msg geo_msg;
+    struct tarzan::geodetic_msg geo_msg{};
     serial::Error err = serial::read_msg<struct tarzan::geodetic_msg>(
         serial, &geo_msg, tarzan::GEODETIC_MSG_LEN);
-    if (err == serial::AsioReadError || err == serial::CobsDecodeError) {
-      spdlog::error(serial::get_error(err));
+    if (err != serial::ReadSuccess) {
+      spdlog::error("plan: {}", serial::get_error(err));
+      if (err == serial::CrcError)
+        spdlog::error("plan: frame carries crc {:#010x}, computed {:#010x} "
+                      "over {} bytes -- the Nucleo computes its CRC "
+                      "differently",
+                      geo_msg.crc, serial::crc_of(geo_msg),
+                      offsetof(tarzan::geodetic_msg, crc));
       return PlanResult::FAULT;
     }
 

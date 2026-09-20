@@ -1368,9 +1368,20 @@ int main(int argc, char *argv[]) {
                    e.what());
     }
 
+    /* A hundred frames discarded before anything downstream sees one.
+       Bounded now: a camera that enumerates but never delivers -- a USB 2
+       port, another process holding it -- used to park mario here forever
+       with nothing logged, the same wait slam_test and pid_test were cured
+       of. */
     rs2::frame frame;
     for (int i = 0; i < 100; i++) {
-      frame = rs_ptr->frame_q.wait_for_frame();
+      try {
+        frame = rs_ptr->frame_q.wait_for_frame(5000);
+      } catch (const rs2::error &) {
+        spdlog::error("No frame from the Realsense in 5 s: is it on a USB 3 "
+                      "port, and is anything else holding it?");
+        return -1;
+      }
     }
   }
 

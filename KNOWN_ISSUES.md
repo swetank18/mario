@@ -51,6 +51,14 @@ defined, and URC scores the light.
 
 ## Fixed
 
+### `mario` waited forever for a RealSense that enumerated but never delivered
+
+The hundred-frame warm-up in `main` called `wait_for_frame()` with no
+timeout: a camera on a USB 2 port, or one another process was holding,
+parked the process there with nothing logged. `slam_test` and `pid_test`
+had already been cured of the same wait; `main` now gives each frame 5 s
+and exits with a message naming the two usual causes.
+
 ### `plan()` navigated on whatever the Nucleo sent, fix or no fix
 
 The Nucleo streams `geodetic_msg` from power-up, and before the receiver has
